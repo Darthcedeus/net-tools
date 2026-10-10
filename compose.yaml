@@ -10,7 +10,7 @@ services:
       APP_ORIGIN: ${APP_ORIGIN:?Run python3 scripts/setup.py first}
       APP_PASSWORD_HASH: ${APP_PASSWORD_HASH:?Run python3 scripts/setup.py first}
     ports:
-      - "127.0.0.1:8080:8080"
+      - "0.0.0.0:8083:8080"
     volumes:
       - subfinder-data:/data
     read_only: true

@@ -20,5 +20,5 @@ else:
         print(json.dumps({'host': name + '.' + domain, 'input': domain, 'sources': sources}), flush=True)
         time.sleep(0.02)
     print(json.dumps({'host': 'API.' + domain.upper() + '.', 'sources': ['another']}), flush=True)
-    print(json.dumps({'host': 'unrelated.example.net', 'sources': ['crtsh']}), flush=True)
+    print(json.dumps({'host': 'unrelated.test.invalid', 'sources': ['crtsh']}), flush=True)
     print('invalid JSON', flush=True)

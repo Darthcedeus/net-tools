@@ -1,4 +1,4 @@
-"""Single-user web service for Subfinder, intended to sit behind Caddy HTTPS."""
+"""Single-user Net Tools web service, intended to sit behind Caddy HTTPS."""
 import csv
 import io
 import json
@@ -33,7 +33,7 @@ class Application:
         self.origin = os.environ.get('APP_ORIGIN', '').rstrip('/')
         parsed = urlsplit(self.origin)
         if parsed.scheme not in ('http', 'https') or not parsed.netloc or parsed.path or parsed.username or parsed.query or parsed.fragment:
-            raise ValueError('APP_ORIGIN must be the exact public origin, e.g. https://subfinder.example.com')
+            raise ValueError('APP_ORIGIN must be the exact public origin, e.g. https://net-tools.humza.xyz')
         self.password_hash = os.environ.get('APP_PASSWORD_HASH', '')
         if not re.fullmatch(r'pbkdf2_sha256\$600000\$[0-9a-f]{32}\$[0-9a-f]{64}', self.password_hash):
             raise ValueError('Set APP_PASSWORD_HASH using scripts/setup.py before starting the application.')
@@ -55,7 +55,7 @@ class Application:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'SubfinderGUI'
+    server_version = 'NetTools'
     protocol_version = 'HTTP/1.1'
 
     @property
@@ -237,8 +237,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.app.store.delete(scan_id)
                     return self.send(200, {'ok': True})
             raise APIError(404, 'Endpoint not found.')
-        if method == 'GET' and path in ('/', '/app.js', '/style.css', '/favicon.svg'):
-            file = STATIC / ('index.html' if path == '/' else path[1:])
+        # Explicit routes support direct visits and browser refreshes without
+        # treating unknown tools, assets, or API paths as the application shell.
+        pages = {'/', '/tools/subdomains', '/activity'}
+        if method == 'GET' and path.rstrip('/') in {'/tools/subdomains', '/activity'}:
+            path = path.rstrip('/')
+        if method == 'GET' and path in pages | {'/app.js', '/tools.js', '/style.css', '/favicon.svg'}:
+            file = STATIC / ('index.html' if path in pages else path[1:])
             return self.send(200, file.read_bytes(), mimetypes.guess_type(file.name)[0] or 'application/octet-stream')
         raise APIError(404, 'Not found.')
 
@@ -302,7 +307,7 @@ def main():
         threading.Thread(target=server.shutdown, daemon=True).start()
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    logging.info('Subfinder GUI listening on port %s', server.server_port)
+    logging.info('Net Tools listening on port %s', server.server_port)
     try:
         server.serve_forever(poll_interval=0.3)
     finally:

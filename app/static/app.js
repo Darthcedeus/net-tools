@@ -1,6 +1,10 @@
 'use strict';
+import { SUBDOMAINS, renderToolDirectory, toolName } from './tools.js';
+
 const $ = (id) => document.getElementById(id);
-const state = { csrf: null, selected: null, history: [], tab: 'discovery', offset: 0, total: 0, query: '', authenticated: false, generation: 0, engine: false, busy: false };
+const state = { csrf: null, selected: null, history: [], tab: 'home', offset: 0, total: 0, query: '', authenticated: false, generation: 0, engine: false, busy: false };
+const ROUTES = { home: '/', discovery: SUBDOMAINS.path, history: '/activity' };
+const PAGE_TITLES = { home: 'Home', discovery: SUBDOMAINS.name, history: 'Activity' };
 const active = (scan) => scan && ['queued', 'running'].includes(scan.status);
 const statuses = { completed: 'Completed', running: 'Discovering', queued: 'Queued', cancelled: 'Cancelled', failed: 'Failed', timed_out: 'Timed out', interrupted: 'Interrupted', limited: 'Result limit reached' };
 let filterTimer, toastTimer;
@@ -21,22 +25,50 @@ function showLogin() {
   state.authenticated = false; state.csrf = null; state.generation++;
   $('boot').hidden = true; $('workspace').hidden = true; $('navigation').hidden = true; $('logout').hidden = true; $('login-view').hidden = false;
   $('password').value = ''; $('password').focus();
+  document.title = 'Net Tools · Sign in';
 }
 function showWorkspace() {
   state.authenticated = true; $('boot').hidden = true; $('login-view').hidden = true; $('workspace').hidden = false; $('navigation').hidden = false; $('logout').hidden = false;
   $('start').disabled = !state.engine;
   message('app-error', state.engine ? '' : 'The Subfinder engine is unavailable. Start this application with Docker to install it.');
+  setTab(routeFromLocation(), { navigation: 'replace', focus: false, scanId: scanIdFromLocation(), load: false });
 }
-function setTab(tab) {
+
+function routeFromLocation() {
+  const path = location.pathname.replace(/\/+$/, '') || '/';
+  return Object.keys(ROUTES).find((tab) => ROUTES[tab] === path) || 'home';
+}
+function scanIdFromLocation() {
+  const id = new URLSearchParams(location.search).get('scan');
+  return id && /^[a-f0-9]{32}$/.test(id) ? id : null;
+}
+function setTab(tab, { navigation = 'push', focus = true, scanId = null, load = true } = {}) {
+  if (!Object.hasOwn(ROUTES, tab)) return;
   state.tab = tab;
-  for (const name of ['discovery', 'history']) {
+  for (const name of Object.keys(ROUTES)) {
     $(name + '-view').hidden = name !== tab;
     $(name + '-tab').classList.toggle('selected', name === tab);
     if (name === tab) $(name + '-tab').setAttribute('aria-current', 'page');
     else $(name + '-tab').removeAttribute('aria-current');
   }
-  document.title = `Subfinder · ${tab === 'discovery' ? 'Discovery' : 'History'}`;
-  if (tab === 'history') refreshHistory().catch(reportError);
+  document.title = `Net Tools · ${PAGE_TITLES[tab]}`;
+  const path = ROUTES[tab] + (tab === 'discovery' && scanId ? `?scan=${scanId}` : '');
+  if (navigation !== 'none' && location.pathname + location.search !== path) {
+    window.history[navigation === 'replace' ? 'replaceState' : 'pushState']({}, '', path);
+  }
+  if (focus) { $(tab + '-view').querySelector('h1').focus({ preventScroll: true }); window.scrollTo(0, 0); }
+  if (load && (tab === 'history' || tab === 'home')) refreshHistory().catch(reportError);
+  else if (load && state.selected) refreshResults().catch(reportError);
+}
+
+async function resumeWorkspace() {
+  const route = location.pathname + location.search, generation = state.generation;
+  await refreshHistory();
+  if (!state.authenticated || generation !== state.generation || route !== location.pathname + location.search) return;
+  const id = scanIdFromLocation();
+  const scan = id ? state.history.find((item) => item.id === id) || await api(`/api/scans/${id}`) : state.selected || state.history[0];
+  if (!state.authenticated || generation !== state.generation || route !== location.pathname + location.search) return;
+  if (scan) { state.selected = scan; state.generation++; paintScan(); if (state.tab === 'discovery') await refreshResults(); }
 }
 function reportError(error) { if (state.authenticated) message('app-error', error.message || 'Could not connect. Try again.'); }
 function statusElement(scan) {
@@ -60,7 +92,7 @@ function paintScan() {
 async function selectScan(scan) {
   state.generation++; state.selected = scan; state.offset = 0; state.query = ''; $('filter').value = '';
   $('cancel').disabled = false; $('cancel').textContent = 'Cancel scan';
-  setTab('discovery'); paintScan(); await refreshResults();
+  setTab('discovery', { scanId: scan.id, load: false }); paintScan(); await refreshResults();
 }
 async function refreshResults() {
   if (!state.selected || !state.authenticated) return;
@@ -93,7 +125,7 @@ async function refreshHistory() {
   for (const scan of history) {
     const row = document.createElement('div'), open = document.createElement('button'), domain = document.createElement('span'), meta = document.createElement('span'), remove = document.createElement('button');
     row.className = 'history-row'; open.className = 'history-open'; domain.className = 'history-domain mono'; meta.className = 'history-meta';
-    domain.textContent = scan.domain; meta.textContent = `${new Date(scan.created * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })} · ${scan.count.toLocaleString()} subdomains · ${elapsed(scan)}`;
+    domain.textContent = scan.domain; meta.textContent = `${toolName(scan.tool)} · ${formatDate(scan.created)} · ${scan.count.toLocaleString()} subdomains · ${elapsed(scan)}`;
     open.append(domain, meta); open.addEventListener('click', () => selectScan(scan).catch(reportError));
     remove.className = 'history-delete'; remove.textContent = '×'; remove.setAttribute('aria-label', `Delete scan for ${scan.domain}`); remove.title = 'Delete scan'; remove.disabled = active(scan);
     remove.addEventListener('click', async () => {
@@ -103,19 +135,46 @@ async function refreshHistory() {
     row.append(open, statusElement(scan), remove); fragment.append(row);
   }
   $('history-list').replaceChildren(fragment); $('history-empty').hidden = !!history.length;
+  renderRecentActivity(history);
 }
+
+function formatDate(created, compact = false) {
+  const options = compact ? { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' } : { dateStyle: 'medium', timeStyle: 'short' };
+  return new Date(created * 1000).toLocaleString(undefined, options);
+}
+function renderRecentActivity(scans) {
+  const fragment = document.createDocumentFragment();
+  for (const scan of scans.slice(0, 3)) {
+    const row = document.createElement('button'), copy = document.createElement('div'), domain = document.createElement('span'), meta = document.createElement('span');
+    row.className = 'recent-row'; copy.className = 'recent-copy'; domain.className = 'history-domain mono'; meta.className = 'history-meta';
+    domain.textContent = scan.domain; meta.textContent = `${toolName(scan.tool)} · ${formatDate(scan.created, true)}`; copy.append(domain, meta);
+    const result = document.createElement('div'), count = document.createElement('span'); result.className = 'recent-result';
+    count.className = 'recent-count'; count.textContent = `${scan.count.toLocaleString()} subdomain${scan.count === 1 ? '' : 's'}`;
+    result.append(statusElement(scan), count); row.append(copy, result);
+    row.addEventListener('click', () => selectScan(scan).catch(reportError)); fragment.append(row);
+  }
+  $('recent-list').replaceChildren(fragment); $('recent-list').hidden = !scans.length; $('recent-empty').hidden = !!scans.length;
+}
+
+renderToolDirectory($('tool-directory'));
+document.addEventListener('click', (event) => {
+  const link = event.target.closest('a[data-route]');
+  if (!link || !state.authenticated || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault(); setTab(link.dataset.route);
+});
+window.addEventListener('popstate', () => {
+  if (!state.authenticated) return;
+  setTab(routeFromLocation(), { navigation: 'none', load: false }); resumeWorkspace().catch(reportError);
+});
 
 $('login-form').addEventListener('submit', async (event) => {
   event.preventDefault(); $('login-button').disabled = true; message('login-error', '');
   try {
     const data = await api('/api/login', { method: 'POST', body: JSON.stringify({ password: $('password').value }) });
-    state.csrf = data.csrf; $('password').value = ''; const session = await api('/api/session'); state.engine = session.engine_available; showWorkspace(); await refreshHistory();
-    if (state.history.length) await selectScan(state.history[0]);
+    state.csrf = data.csrf; $('password').value = ''; const session = await api('/api/session'); state.engine = session.engine_available; showWorkspace(); await resumeWorkspace();
   } catch (error) { message('login-error', error.message); } finally { $('login-button').disabled = false; }
 });
 $('logout').addEventListener('click', async () => { try { await api('/api/logout', { method: 'POST', body: '{}' }); state.selected = null; state.history = []; state.query = ''; state.offset = 0; $('filter').value = ''; paintScan(); message('scan-note', ''); showLogin(); } catch (error) { reportError(error); } });
-$('discovery-tab').addEventListener('click', () => setTab('discovery'));
-$('history-tab').addEventListener('click', () => setTab('history'));
 $('first-scan').addEventListener('click', () => { setTab('discovery'); $('domain').focus(); });
 $('refresh-history').addEventListener('click', () => refreshHistory().catch(reportError));
 $('scan-form').addEventListener('submit', async (event) => {
@@ -158,7 +217,7 @@ $('export').addEventListener('change', async () => {
 async function poll() {
   if (state.busy || !state.authenticated || document.hidden) return;
   state.busy = true;
-  try { if (state.tab === 'discovery' && active(state.selected)) await refreshResults(); if (state.tab === 'history' || state.history.some(active)) await refreshHistory(); }
+  try { if (state.tab === 'discovery' && active(state.selected)) await refreshResults(); if (['home', 'history'].includes(state.tab) || state.history.some(active)) await refreshHistory(); }
   catch (error) { reportError(error); } finally { state.busy = false; }
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
@@ -166,6 +225,6 @@ setInterval(poll, 2000);
 (async () => {
   try {
     const session = await api('/api/session'); if (!session.authenticated) return showLogin();
-    state.csrf = session.csrf; state.engine = session.engine_available; showWorkspace(); await refreshHistory(); if (state.history.length) await selectScan(state.history[0]);
+    state.csrf = session.csrf; state.engine = session.engine_available; showWorkspace(); await resumeWorkspace();
   } catch (error) { if (!state.authenticated) { showLogin(); message('login-error', 'Could not reach the server. Refresh to reconnect.'); } else reportError(error); }
 })();

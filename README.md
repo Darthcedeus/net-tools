@@ -1,8 +1,19 @@
-# Subfinder GUI
+# Net Tools
 
-A small, dark-themed, mobile-friendly, single-user web interface for [ProjectDiscovery Subfinder](https://github.com/projectdiscovery/subfinder). Run it on an Ubuntu VM with Docker Compose and expose it through your existing Caddy server.
+A private, dark-themed, mobile-friendly suite for network discovery and diagnostics. Run it on an Ubuntu VM with Docker Compose and expose it through your existing Caddy server. **Subdomain Finder**, powered by [ProjectDiscovery Subfinder](https://github.com/projectdiscovery/subfinder), is the first working tool.
 
-Enter a domain, watch passive discovery results arrive, search them, and copy or download TXT, CSV, or JSON. Scan history survives container recreation, and scans continue when your browser closes. You can cancel scans, restore options for another run, and delete old results. The interface works on phones without horizontal scrolling.
+The home page shows the tool directory and recent activity. Open Subdomain Finder to watch passive discovery results arrive, search them, and copy or download TXT, CSV, or JSON. Saved activity survives container recreation, and scans continue when your browser closes. You can cancel scans, restore options for another run, and delete old results. The interface works on phones without horizontal scrolling.
+
+| Page | Route | Status |
+| --- | --- | --- |
+| Home / tool directory | `/` | Available |
+| Subdomain Finder | `/tools/subdomains` | Available |
+| Shared activity | `/activity` | Available |
+| DNS Lookup | — | Planned |
+| TLS Inspector | — | Planned |
+| HTTP Inspector | — | Planned |
+
+Planned tools are clearly marked and cannot be opened. All available pages share the same password login, navigation, and theme. Direct links, refreshes, and browser back/forward navigation are supported.
 
 ## Deploy on Ubuntu
 
@@ -16,18 +27,18 @@ cd net-tools
 python3 scripts/setup.py
 docker compose up -d --build
 docker compose ps
-curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8083/healthz
 ```
 
-The setup prompts for the exact public origin, such as `https://subfinder.yourdomain.com`, and a password of at least 12 characters. It creates a private `.env` containing a PBKDF2 password hash. Never send your password or provider keys to anyone. The origin is used for browser request checks and secure cookies; update it if you change the hostname. The app is served at the hostname root, not under a subpath.
+The setup prompts for the exact public origin, such as `https://net-tools.humza.xyz`, and a password of at least 12 characters. It creates a private `.env` containing a PBKDF2 password hash. Never send your password or provider keys to anyone. The origin is used for browser request checks and secure cookies; update it if you change the hostname. The app is served at the hostname root, not under a subpath.
 
 Add this block to your host Caddyfile (usually `/etc/caddy/Caddyfile`), replacing the domain with the same hostname you entered during setup:
 
 ```caddyfile
-subfinder.yourdomain.com {
+net-tools.humza.xyz {
     encode zstd gzip
     header Strict-Transport-Security "max-age=31536000"
-    reverse_proxy 127.0.0.1:8080
+    reverse_proxy 127.0.0.1:8083
 }
 ```
 
@@ -38,11 +49,32 @@ sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 
-Open your public URL on your computer or phone and sign in. The Compose service binds port 8080 only to localhost. Do not change it to a public bind when using host Caddy. If port 8080 is already in use, change the host side of the port mapping and Caddy's upstream together, e.g. `127.0.0.1:8081:8080` and `reverse_proxy 127.0.0.1:8081`.
+Open your public URL on your computer or phone and sign in. Compose publishes host port **8083 on all interfaces**, using `0.0.0.0:8083:8080`, and forwards it to port 8080 inside the container. Caddy can still use `127.0.0.1:8083` as its upstream. Browser access uses the configured public HTTPS origin; the VM's HTTP IP address will not match the login origin check.
 
 ### If Caddy also runs in Docker
 
 Put Caddy and this service on a shared user-defined Docker network, remove the `ports` mapping from this service, and use `reverse_proxy subfinder:8080`. In a Caddy container, `127.0.0.1` refers to Caddy itself, not the Subfinder container. Keep Caddy's existing volumes for certificates. `APP_ORIGIN` stays the public HTTPS origin.
+
+### Update an existing deployment
+
+From the existing checkout on your VM:
+
+```sh
+git pull --ff-only
+docker compose up -d --build
+curl http://127.0.0.1:8083/healthz
+```
+
+Your existing `.env`, provider configuration, and saved scan volume are retained. You do not need to rerun setup if `APP_ORIGIN` already matches `https://net-tools.humza.xyz`. The service and volume keep their original `subfinder` / `subfinder-data` names to preserve deployed data.
+
+If Git refuses to pull because you previously edited `compose.yaml` to change the port, save that file and restore the tracked version before pulling. The updated version already includes `0.0.0.0:8083`:
+
+```sh
+cp compose.yaml compose.yaml.local-backup
+git restore compose.yaml
+git pull --ff-only
+docker compose up -d --build
+```
 
 ## Provider API keys (optional)
 
@@ -73,7 +105,7 @@ Logs and health:
 ```sh
 docker compose logs --tail=100 -f subfinder
 docker compose ps
-curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8083/healthz
 ```
 
 Health checks report that the web service is responding; the UI separately checks that the engine is installed. Provider warnings can occur even when Subfinder exits successfully, and partial coverage is normal. Raw provider stderr is intentionally never returned to the browser because it can contain credentials. This wrapper does not persist those logs.
@@ -128,3 +160,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 The app is a single-process, single-user utility. Run one replica per data volume. It has no account management, shared-user separation, distributed queue, or built-in DNS validation. The Docker Compose setup is the supported deployment.
+
+## Extending the suite
+
+`app/static/tools.js` is the frontend tool catalog, including display names, descriptions, availability, and routes. The shell handles navigation and shared activity; existing Subdomain Finder endpoints remain under `/api/scans`. New tools should add their own view and API handler, then register an available route in the catalog and the server page allowlist. Persist each new tool’s results in its own model and include its tool identity when adding records to shared activity. The current scan store identifies existing records as `subdomains` without changing the database schema.

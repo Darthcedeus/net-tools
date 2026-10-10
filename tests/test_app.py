@@ -57,6 +57,7 @@ class StoreTests(unittest.TestCase):
             reopened = Store(path)
             self.assertEqual(reopened.get('id')['status'], 'interrupted')
             self.assertEqual(reopened.get('id')['count'], 1)
+            self.assertEqual(reopened.get('id')['tool'], 'subdomains')
             self.assertEqual(reopened.results('id')['items'][0]['sources'], ['crtsh', 'hackertarget'])
             self.assertEqual(reopened.results('id', '%')['total'], 0)
             reopened.delete('id')
@@ -219,11 +220,36 @@ class APITests(unittest.TestCase):
 
     def test_static_security_headers_health_and_missing_engine(self):
         status, body, headers = self.request('GET', '/')
-        self.assertEqual(status, 200); self.assertIn('Subfinder', body)
+        self.assertEqual(status, 200); self.assertIn('Net Tools', body)
         self.assertIn("frame-ancestors 'none'", headers['Content-Security-Policy'])
         self.assertEqual(self.request('GET', '/healthz')[0], 200)
         self.login(); self.app.runner.binary = '/nonexistent/subfinder'
         self.assertEqual(self.request('POST', '/api/scans', {'domain': 'example.com'})[0], 503)
+
+    def test_suite_routes_refresh_and_unknown_routes(self):
+        for path in ['/', '/tools/subdomains', '/tools/subdomains/', '/activity', '/activity/', '/tools/subdomains?scan=' + 'a' * 32]:
+            with self.subTest(path=path):
+                status, body, headers = self.request('GET', path)
+                self.assertEqual(status, 200)
+                self.assertIn('Net Tools', body)
+                self.assertIn('type="module"', body)
+                self.assertTrue(headers['Content-Type'].startswith('text/html'))
+        for path in ['/tools/dns', '/tools/not-implemented', '/missing.js', '/api/not-implemented', '/app/../security.py']:
+            with self.subTest(path=path):
+                self.assertIn(self.request('GET', path)[0], (401, 404))
+        status, body, headers = self.request('GET', '/tools.js')
+        self.assertEqual(status, 200)
+        self.assertIn('available: false', body)
+        self.assertIn('javascript', headers['Content-Type'])
+
+    def test_suite_deep_links_do_not_bypass_api_auth(self):
+        self.assertEqual(self.request('GET', '/tools/subdomains')[0], 200)
+        self.assertEqual(self.request('GET', '/api/scans')[0], 401)
+        self.login()
+        scan = self.request('POST', '/api/scans', {'domain': 'example.com', **OPTIONS})[1]
+        self.assertEqual(scan['tool'], 'subdomains')
+        wait_for(self.app.store, scan['id'], lambda s: s['status'] == 'completed')
+        self.assertEqual(self.request('GET', '/api/scans')[1][0]['tool'], 'subdomains')
 
 
 if __name__ == '__main__':

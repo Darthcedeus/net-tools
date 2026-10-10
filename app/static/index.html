@@ -4,19 +4,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b1118">
-  <meta name="description" content="Your private, self-hosted workspace for passive subdomain discovery.">
-  <title>Subfinder · Discovery</title>
+  <meta name="description" content="Net Tools: your private workspace for network discovery and diagnostics.">
+  <title>Net Tools</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
-  <script src="/app.js" defer></script>
+  <script src="/app.js" type="module"></script>
 </head>
 <body>
   <header class="header">
     <div class="header-inner">
-      <a class="brand" href="/" aria-label="Subfinder home"><img src="/favicon.svg" width="32" height="32" alt=""><span>Subfinder</span></a>
+      <a class="brand" href="/" data-route="home" aria-label="Net Tools home"><img src="/favicon.svg" width="32" height="32" alt=""><span>Net Tools</span></a>
       <nav id="navigation" aria-label="Main navigation" hidden>
-        <button class="nav-item selected" id="discovery-tab" aria-current="page">Discovery</button>
-        <button class="nav-item" id="history-tab">History</button>
+        <a class="nav-item" href="/" data-route="home" id="home-tab">Home</a>
+        <a class="nav-item" href="/tools/subdomains" data-route="discovery" id="discovery-tab">Subdomains</a>
+        <a class="nav-item" href="/activity" data-route="history" id="history-tab">Activity</a>
       </nav>
       <button class="sign-out" id="logout" hidden>Sign out</button>
     </div>
@@ -24,7 +25,7 @@
   <main>
     <div id="boot" class="boot" role="status">Opening your workspace…</div>
     <section id="login-view" class="login-view" hidden>
-      <div class="intro"><h1>Your discovery workspace.</h1><p>Sign in to your private Subfinder instance.</p></div>
+      <div class="intro"><h1>Your network workspace.</h1><p>Sign in to your private Net Tools instance.</p></div>
       <form id="login-form" class="panel login-panel">
         <label for="password">Password</label>
         <input id="password" type="password" autocomplete="current-password" required maxlength="1024" placeholder="Enter your password">
@@ -35,8 +36,20 @@
     </section>
     <div id="workspace" hidden>
       <p id="app-error" class="notice error" role="alert" hidden></p>
-      <section id="discovery-view">
-        <div class="intro"><h1>Discover what’s beneath.</h1><p>Find subdomains from passive sources. One domain, a clearer picture.</p></div>
+      <section id="home-view" hidden>
+        <div class="intro"><h1 tabindex="-1">Your network, in focus.</h1><p>A private workspace for discovery and diagnostics.</p></div>
+        <section class="directory-section" aria-labelledby="tools-title">
+          <h2 id="tools-title">Tools</h2><p class="section-description">One workspace. More ways to explore.</p>
+          <ul id="tool-directory" class="tool-directory"></ul>
+        </section>
+        <section class="recent-section" aria-labelledby="recent-title">
+          <div class="section-top"><h2 id="recent-title">Recent activity</h2><a class="text-link" href="/activity" data-route="history">View all</a></div>
+          <div id="recent-list" class="recent-list"></div>
+          <div id="recent-empty" class="empty" hidden><h3>Your next discovery starts here.</h3><p>Open Subdomain Finder to explore a domain. Your recent results will appear here.</p><a class="button primary" href="/tools/subdomains" data-route="discovery">Open Subdomain Finder</a></div>
+        </section>
+      </section>
+      <section id="discovery-view" hidden>
+        <div class="intro"><h1 tabindex="-1">Subdomain Finder</h1><p>Find subdomains from passive sources. One domain, a clearer picture.</p></div>
         <form id="scan-form" class="panel scan-panel">
           <label for="domain">Target domain</label>
           <div class="target-row"><input id="domain" type="text" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" required maxlength="253" placeholder="example.com"><button id="start" class="button primary" type="submit">Start discovery</button></div>
@@ -66,12 +79,12 @@
         </section>
       </section>
       <section id="history-view" hidden>
-        <div class="intro"><h1>Your discoveries.</h1><p>Pick up where you left off. Your latest 100 finished scans are saved here.</p></div>
-        <div class="section-top history-heading"><h2>Scan history</h2><button id="refresh-history" class="button small">Refresh</button></div>
+        <div class="intro"><h1 tabindex="-1">Your activity.</h1><p>Pick up where you left off. Results from your tools, in one place.</p></div>
+        <div class="section-top history-heading"><h2>Activity history</h2><button id="refresh-history" class="button small">Refresh</button></div>
         <div id="history-list" class="history-list"></div>
-        <div id="history-empty" class="empty" hidden><img src="/favicon.svg" alt="" width="44" height="44"><h3>A fresh workspace.</h3><p>Your scans will appear here as you discover domains.</p><button id="first-scan" class="button primary">Start a discovery</button></div>
+        <div id="history-empty" class="empty" hidden><img src="/favicon.svg" alt="" width="44" height="44"><h3>A fresh workspace.</h3><p>Your discoveries will appear here as you use your tools.</p><button id="first-scan" class="button primary">Open Subdomain Finder</button></div>
       </section>
-      <footer>Self-hosted. Your history stays on your server.<span>Subfinder GUI</span></footer>
+      <footer>Self-hosted. Your history stays on your server.<span>Net Tools</span></footer>
     </div>
   </main>
   <div id="toast" class="toast" role="status" hidden></div>

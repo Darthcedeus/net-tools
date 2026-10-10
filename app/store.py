@@ -44,6 +44,9 @@ class Store:
             return None
         scan = dict(row)
         scan['options'] = json.loads(scan['options'])
+        # Existing scans belong to the first suite tool. No data migration is
+        # needed to identify them in the shared activity interface.
+        scan['tool'] = 'subdomains'
         return scan
 
     def get(self, scan_id):

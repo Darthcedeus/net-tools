@@ -17,7 +17,7 @@ def main():
         if input('.env already exists. Replace it and change the password? [y/N] ').strip().lower() != 'y':
             print('Kept the existing configuration.')
             return
-    origin = input('Public URL (e.g. https://subfinder.example.com): ').strip().rstrip('/')
+    origin = input('Public URL (e.g. https://net-tools.humza.xyz): ').strip().rstrip('/')
     parsed = urlsplit(origin)
     if parsed.scheme not in ('http', 'https') or not parsed.netloc or parsed.path or parsed.query or parsed.fragment or parsed.username or any(c in origin for c in "'\"\n\r"):
         sys.exit('Enter a complete origin with no path, credentials, or query string.')
