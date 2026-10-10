@@ -212,13 +212,13 @@ class Handler(BaseHTTPRequestHandler):
                     elif fmt == 'csv':
                         output = io.StringIO()
                         writer = csv.writer(output)
-                        writer.writerow(['subdomain', 'sources'])
+                        writer.writerow(['subdomain', 'sources', 'ip_addresses', 'dns_status'])
                         # Hostnames are validated; provider names are escaped for spreadsheet formulas.
                         for row in rows:
                             source = ', '.join(row['sources'])
                             if source.startswith(('=', '+', '-', '@', '\t', '\r')):
                                 source = "'" + source
-                            writer.writerow([row['host'], source])
+                            writer.writerow([row['host'], source, ', '.join(row['ips']), row['dns_status']])
                         body, mime = output.getvalue(), 'text/csv; charset=utf-8'
                     elif fmt == 'txt':
                         body, mime = ''.join(r['host'] + '\n' for r in rows), 'text/plain; charset=utf-8'

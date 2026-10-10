@@ -2,7 +2,7 @@
 
 A private, dark-themed, mobile-friendly suite for network discovery and diagnostics. Run it on an Ubuntu VM with Docker Compose and expose it through your existing Caddy server. **Subdomain Finder**, powered by [ProjectDiscovery Subfinder](https://github.com/projectdiscovery/subfinder), is the first working tool.
 
-The home page shows the tool directory and recent activity. Open Subdomain Finder to watch passive discovery results arrive, search them, and copy or download TXT, CSV, or JSON. Saved activity survives container recreation, and scans continue when your browser closes. You can cancel scans, restore options for another run, and delete old results. The interface works on phones without horizontal scrolling.
+The home page shows the tool directory and recent activity. Open Subdomain Finder to watch passive discovery results arrive with their IPv4 and IPv6 addresses, search them, and copy or download TXT, CSV, or JSON. Saved activity survives container recreation, and scans continue when your browser closes. You can cancel scans, restore options for another run, and delete old results. The interface works on phones without horizontal scrolling.
 
 | Page | Route | Status |
 | --- | --- | --- |
@@ -95,10 +95,10 @@ Example credential shape: `shodan: ["your-key"]`. Providers such as Censys have 
 
 - Password login is required for every scan, result, history, and export API. Sessions expire after 12 hours and are invalidated on app restart. Passwords use PBKDF2-SHA256 with a random salt and 600,000 iterations. Cookies are HttpOnly and SameSite=Strict; HTTPS origins add Secure. Mutations require an origin check and a session-specific CSRF token. Login is limited to 10 attempts per five minutes globally and per direct peer; forwarded headers cannot bypass this.
 - One scan runs at a time; up to five more wait in the queue. Each scan has a configurable time limit (1–10 minutes), source timeout (5–60 seconds), and request rate (1–50/second). A hard wall-clock limit adds 30 seconds for cleanup. Results are capped at 10,000 per scan. Partial results survive cancellation, errors, timeouts, and restart.
-- The tool runs passively; the UI does not expose active resolution, arbitrary CLI arguments, resolvers, proxy settings, or file paths. Discovered hostnames are not verified as live. Use it for domains you own or have permission to assess.
+- Discovery uses passive Subfinder sources. As each unique hostname arrives, up to eight DNS workers look up A and AAAA records through the container’s configured resolver, with a three-second lookup budget per hostname and the overall scan deadline. This adds DNS queries, but no HTTP requests, connections to discovered hosts, or port scans. Addresses are a snapshot taken during that scan; DNS resolution does not prove a service is live. No-record, timeout, partial, failed, and cancelled lookups are labeled separately. Existing saved scans retain their results and show “Not checked” for IPs; rerun them to resolve addresses. Use it for domains you own or have permission to assess.
 - Scan records and results live in a SQLite database in the `subfinder-data` named volume. The latest 100 finished scans are retained, plus active jobs. Queued/running jobs become interrupted on restart and can be run again.
-- Filtering matches subdomain names. Copy and export include **all matching results**, across every page. JSON includes scan metadata and source names. TXT is one hostname per line; CSV has hostname and sources columns.
-- The container runs without root, with a read-only filesystem, dropped capabilities, bounded resources, and a writable temporary filesystem. No Docker socket is mounted. The application has no pip, npm, CDN, or font dependencies. The frontend is plain HTML/CSS/JavaScript, and the backend uses Python's standard library.
+- Filtering matches subdomain names. Copy and export include **all matching results**, across every page. JSON includes scan metadata, source names, IP addresses, and DNS status. CSV includes `subdomain`, `sources`, `ip_addresses`, and `dns_status` columns. TXT and Copy remain one hostname per line.
+- The container runs without root, with a read-only filesystem, dropped capabilities, bounded resources, and a writable temporary filesystem. No Docker socket is mounted. The frontend is plain HTML/CSS/JavaScript without npm, CDN, or font dependencies. The Python backend uses the standard library plus [dnspython](https://dnspython.readthedocs.io/en/stable/resolver-class.html) for DNS lookups with bounded timeouts; Docker installs the pinned dependency automatically.
 
 Logs and health:
 
@@ -143,9 +143,12 @@ To restore, stop the app and copy your backup back into `/data`, ensuring owners
 
 ## Local development and tests
 
-Python 3.10+ is sufficient for the backend. The Docker image includes the pinned Subfinder binary; local development requires a separate Subfinder installation. To run without Docker, generate a temporary password hash and launch the app:
+Python 3.10+ is sufficient for the backend. The Docker image includes the pinned Subfinder binary; local development requires a separate Subfinder installation. To run without Docker, install the Python dependency, generate a temporary password hash and launch the app:
 
 ```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
 export APP_ORIGIN=http://localhost:8080
 export APP_PASSWORD_HASH="$(python3 -c 'from app.security import hash_password; import getpass; print(hash_password(getpass.getpass("Development password: ")))')"
 export DATA_DIR="$PWD/data"
@@ -153,7 +156,7 @@ export HOST=127.0.0.1
 python3 -m app.server
 ```
 
-Open `http://localhost:8080` exactly (rather than `127.0.0.1`), so origin checks match. HTTP development cookies are not Secure; public deployments should always use HTTPS. The UI reports a missing engine instead of simulating results. The deterministic integration tests use an explicit fixture executable and do not contact real passive sources:
+Open `http://localhost:8080` exactly (rather than `127.0.0.1`), so origin checks match. HTTP development cookies are not Secure; public deployments should always use HTTPS. The UI reports a missing engine instead of simulating results. The deterministic integration tests use an explicit fixture executable and do not contact real passive sources or public DNS:
 
 ```sh
 python3 -m unittest discover -s tests -v

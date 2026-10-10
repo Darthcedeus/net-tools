@@ -49,7 +49,7 @@
         </section>
       </section>
       <section id="discovery-view" hidden>
-        <div class="intro"><h1 tabindex="-1">Subdomain Finder</h1><p>Find subdomains from passive sources. One domain, a clearer picture.</p></div>
+        <div class="intro"><h1 tabindex="-1">Subdomain Finder</h1><p>Find subdomains from passive sources, then resolve their IPv4 and IPv6 addresses.</p></div>
         <form id="scan-form" class="panel scan-panel">
           <label for="domain">Target domain</label>
           <div class="target-row"><input id="domain" type="text" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" required maxlength="253" placeholder="example.com"><button id="start" class="button primary" type="submit">Start discovery</button></div>
@@ -73,7 +73,7 @@
             <button class="button" id="copy"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="3" width="12" height="15" rx="2"></rect><path d="M15 21H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2"></path></svg>Copy</button>
             <select id="export" class="button" aria-label="Export results"><option value="">Export</option><option value="txt">Text (.txt)</option><option value="csv">CSV (.csv)</option><option value="json">JSON (.json)</option></select>
           </div>
-          <div class="result-table" id="result-table" hidden><table><thead><tr><th scope="col">Subdomain</th><th scope="col">Sources</th></tr></thead><tbody id="result-rows"></tbody></table></div>
+          <div class="result-table" id="result-table" hidden><table><thead><tr><th scope="col">Subdomain</th><th scope="col">IP addresses</th><th scope="col">Sources</th></tr></thead><tbody id="result-rows"></tbody></table></div>
           <div id="empty" class="empty"><img src="/favicon.svg" alt="" width="44" height="44"><h3>A clearer picture starts here.</h3><p>Enter a domain above to discover its subdomains.</p></div>
           <div id="pagination" class="pagination" hidden><span class="muted" id="page-label"></span><div><button class="button small" id="previous">Previous</button><button class="button small" id="next">Next</button></div></div>
         </section>

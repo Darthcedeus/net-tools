@@ -7,16 +7,19 @@ import subprocess
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, wait
 
+from app.resolver import resolve_host
 from app.security import normalize_domain
 
 
 class Runner:
-    def __init__(self, store, binary='subfinder', provider_config=None, max_results=10_000):
+    def __init__(self, store, binary='subfinder', provider_config=None, max_results=10_000, resolver=None):
         self.store = store
         self.binary = binary
         self.provider_config = provider_config
         self.max_results = max_results
+        self.resolver = resolver or resolve_host
         self.jobs = queue.Queue(maxsize=5)
         self.lock = threading.RLock()
         self.cancellations = {}
@@ -88,22 +91,51 @@ class Runner:
         self.store.update(scan_id, status='running', started=time.time())
         lines = queue.Queue(maxsize=256)
         reached_limit = threading.Event()
+        deadline = time.monotonic() + opts['max_time'] * 60 + 30
+        pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='dns')
+        lookups = set()
+        status, error = 'failed', 'The scan could not be processed. Check server logs.'
+
+        def lookup(host):
+            if event.is_set() or self.stopping.is_set() or time.monotonic() >= deadline:
+                return
+            try:
+                ips, dns_status = self.resolver(host)
+            except Exception:
+                ips, dns_status = [], 'error'
+            self.store.set_addresses(scan_id, host, ips, dns_status)
+
+        def schedule(host):
+            lookups.add(pool.submit(lookup, host))
+
         try:
-            self._consume(scan_id, scan, event, command, lines, reached_limit)
+            status, error = self._consume(scan_id, scan, event, command, lines, reached_limit, deadline, schedule)
+            pending = lookups
+            while pending and not event.is_set() and not self.stopping.is_set() and time.monotonic() < deadline:
+                _, pending = wait(pending, timeout=0.1)
+            if event.is_set() or self.stopping.is_set():
+                status = 'cancelled'
+            elif pending and status == 'completed':
+                status, error = 'timed_out', 'IP lookups reached the scan time limit. Partial results are saved.'
         finally:
             with self.lock:
                 if self.process and self.process.poll() is None:
                     self.process.kill()
                     self.process.wait(timeout=3)
                 self.process = None
+            # Running DNS requests take at most three seconds; queued requests
+            # are discarded on cancellation or deadline. Never leave workers
+            # updating a finished/deleted scan.
+            pool.shutdown(wait=True, cancel_futures=True)
+            self.store.finish_addresses(scan_id, 'cancelled' if event.is_set() or self.stopping.is_set() else 'timeout' if time.monotonic() >= deadline else 'not_checked')
+        self.store.update(scan_id, status=status, finished=time.time(), error=error)
 
-    def _consume(self, scan_id, scan, event, command, lines, reached_limit):
+    def _consume(self, scan_id, scan, event, command, lines, reached_limit, deadline, schedule):
         opts = scan['options']
         try:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         except OSError:
-            self.store.update(scan_id, status='failed', finished=time.time(), error='Subfinder is unavailable. Check the container build and binary path.')
-            return
+            return 'failed', 'Subfinder is unavailable. Check the container build and binary path.'
         with self.lock:
             self.process = process
 
@@ -131,7 +163,6 @@ class Runner:
                    threading.Thread(target=read_output, args=(process.stderr, 'verbose'), daemon=True)]
         for reader in readers:
             reader.start()
-        deadline = time.monotonic() + opts['max_time'] * 60 + 30
         status, error = 'completed', None
         while any(reader.is_alive() for reader in readers) or not lines.empty() or process.poll() is None:
             if event.is_set() or self.stopping.is_set():
@@ -163,7 +194,8 @@ class Runner:
                 if not isinstance(sources, list):
                     sources = [sources]
                 sources = sorted({s[:80] for s in sources if isinstance(s, str)})[:100]
-                self.store.add_result(scan_id, host, sources)
+                if self.store.add_result(scan_id, host, sources):
+                    schedule(host)
             except (ValueError, KeyError, TypeError, UnicodeError):
                 continue
         if process.poll() is None:
@@ -178,11 +210,11 @@ class Runner:
         if status == 'completed' and process.returncode != 0:
             # Provider logs can include secrets; never send raw stderr to the browser.
             status, error = 'failed', 'Subfinder exited with an error. Check the provider configuration. Partial results are saved.'
-        self.store.update(scan_id, status=status, finished=time.time(), error=error)
+        return status, error
 
     def close(self):
         self.stopping.set()
         with self.lock:
             for event in self.cancellations.values():
                 event.set()
-        self.worker.join(timeout=6)
+        self.worker.join(timeout=10)

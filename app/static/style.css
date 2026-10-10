@@ -423,7 +423,18 @@ th {
   border-bottom:1px solid var(--line);
 }
 th:first-child {
-  width:48%;
+  width:34%;
+}
+.result-table th:nth-child(2) {
+  width:40%;
+}
+.ip-address {
+  font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+  font-size:13px;
+}
+.dns-note {
+  color:var(--muted);
+  font-size:12px;
 }
 td {
   padding:17px 20px;
@@ -943,6 +954,13 @@ footer {
   }
   .result-table td+td {
     margin-top:7px;
+  }
+  .result-table td[data-label]::before {
+    content:attr(data-label);
+    display:block;
+    font-size:10px;
+    color:var(--muted);
+    margin-bottom:4px;
   }
   .source {
     font-size:10px;

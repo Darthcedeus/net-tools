@@ -87,7 +87,7 @@ function paintScan() {
   $('scan-domain').textContent = scan.domain;
   $('scan-stats').textContent = `${scan.count.toLocaleString()} subdomain${scan.count === 1 ? '' : 's'} · ${elapsed(scan)}`;
   $('cancel').hidden = !active(scan); $('rerun').hidden = active(scan);
-  message('scan-note', scan.error || (scan.status === 'queued' ? 'Your scan is queued and will start when the current scan finishes.' : scan.status === 'running' ? 'Discovery is running. You can leave this page; results will be saved on your server.' : ''));
+  message('scan-note', scan.error || (scan.status === 'queued' ? 'Your scan is queued and will start when the current scan finishes.' : scan.status === 'running' ? 'Discovery and IP lookups are running. You can leave this page; results will be saved on your server.' : ''));
 }
 async function selectScan(scan) {
   state.generation++; state.selected = scan; state.offset = 0; state.query = ''; $('filter').value = '';
@@ -97,7 +97,10 @@ async function selectScan(scan) {
 async function refreshResults() {
   if (!state.selected || !state.authenticated) return;
   const id = state.selected.id, generation = state.generation, offset = state.offset, query = state.query;
-  const [scan, results] = await Promise.all([api(`/api/scans/${id}`), api(`/api/scans/${id}/results?offset=${offset}&q=${encodeURIComponent(query)}`)]);
+  // Read results after scan status so a completed scan cannot display a stale
+  // "Resolving" snapshot just as polling stops.
+  const scan = await api(`/api/scans/${id}`);
+  const results = await api(`/api/scans/${id}/results?offset=${offset}&q=${encodeURIComponent(query)}`);
   if (generation !== state.generation || id !== state.selected?.id || offset !== state.offset || query !== state.query) return;
   state.selected = scan; state.total = results.total; paintScan();
   if (results.total && offset >= results.total) { state.offset = 0; return refreshResults(); }
@@ -105,8 +108,18 @@ async function refreshResults() {
   for (const item of results.items) {
     const row = document.createElement('tr'), host = document.createElement('td'), sources = document.createElement('td'), list = document.createElement('div');
     host.textContent = item.host; list.className = 'source-list';
+    const addresses = document.createElement('td'); addresses.className = 'ip-cell'; addresses.dataset.label = 'IP addresses';
+    for (const ip of item.ips || []) {
+      const value = document.createElement('div'); value.className = 'ip-address';
+      const groups = ip.split(':');
+      groups.forEach((group, index) => { value.append(document.createTextNode(group)); if (index < groups.length - 1) value.append(document.createTextNode(':'), document.createElement('wbr')); });
+      addresses.append(value);
+    }
+    const dnsLabels = { pending: 'Resolving…', no_records: 'No A/AAAA records', timeout: 'Lookup timed out', error: 'Lookup failed', cancelled: 'Lookup cancelled', not_checked: 'Not checked · rerun scan', partial: 'Some lookups failed' };
+    if (!(item.ips || []).length || item.dns_status === 'partial') { const note = document.createElement('span'); note.className = 'dns-note'; note.textContent = dnsLabels[item.dns_status] || 'Not checked · rerun scan'; addresses.append(note); }
+    sources.dataset.label = 'Sources';
     for (const source of item.sources) { const label = document.createElement('span'); label.className = 'source'; label.textContent = source; list.append(label); }
-    sources.append(list); row.append(host, sources); fragment.append(row);
+    sources.append(list); row.append(host, addresses, sources); fragment.append(row);
   }
   $('result-rows').replaceChildren(fragment);
   $('result-table').hidden = !results.items.length; $('empty').hidden = !!results.items.length;

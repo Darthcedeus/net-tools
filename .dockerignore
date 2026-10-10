@@ -11,5 +11,6 @@ __pycache__
 README.md
 *.sqlite3*
 node_modules
+.venv
 output
 .DS_Store

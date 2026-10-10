@@ -24,6 +24,12 @@ class Store:
                     PRIMARY KEY (scan_id, host)
                 );
             ''')
+            columns = {r['name'] for r in db.execute('PRAGMA table_info(results)')}
+            if 'ips' not in columns:
+                db.execute("ALTER TABLE results ADD COLUMN ips TEXT NOT NULL DEFAULT '[]'")
+            if 'dns_status' not in columns:
+                db.execute("ALTER TABLE results ADD COLUMN dns_status TEXT NOT NULL DEFAULT 'not_checked'")
+            db.execute("UPDATE results SET dns_status='not_checked' WHERE dns_status='pending'")
             db.execute("UPDATE scans SET status='interrupted', finished=?, error=? WHERE status IN ('queued', 'running')",
                        (time.time(), 'The application restarted before this scan finished. Run it again.'))
 
@@ -78,8 +84,18 @@ class Store:
                 sources = sorted(set(json.loads(row['sources'])) | set(sources))
                 db.execute('UPDATE results SET sources=? WHERE scan_id=? AND host=?', (json.dumps(sources), scan_id, host))
             else:
-                db.execute('INSERT INTO results VALUES (?,?,?)', (scan_id, host, json.dumps(sources)))
+                db.execute("INSERT INTO results (scan_id,host,sources,dns_status) VALUES (?,?,?,'pending')", (scan_id, host, json.dumps(sources)))
                 db.execute('UPDATE scans SET count=count+1 WHERE id=?', (scan_id,))
+            return row is None
+
+    def set_addresses(self, scan_id, host, ips, status):
+        with self.connect() as db:
+            db.execute('UPDATE results SET ips=?,dns_status=? WHERE scan_id=? AND host=?',
+                       (json.dumps(ips), status, scan_id, host))
+
+    def finish_addresses(self, scan_id, status):
+        with self.connect() as db:
+            db.execute("UPDATE results SET dns_status=? WHERE scan_id=? AND dns_status='pending'", (status, scan_id))
 
     def results(self, scan_id, query='', offset=0, limit=200):
         query = query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
@@ -87,9 +103,10 @@ class Store:
             params = (scan_id, '%' + query + '%')
             where = "scan_id=? AND host LIKE ? ESCAPE '\\'"
             total = db.execute('SELECT count(*) FROM results WHERE ' + where, params).fetchone()[0]
-            rows = db.execute('SELECT host,sources FROM results WHERE ' + where + ' ORDER BY host LIMIT ? OFFSET ?',
+            rows = db.execute('SELECT host,sources,ips,dns_status FROM results WHERE ' + where + ' ORDER BY host LIMIT ? OFFSET ?',
                               (*params, limit, offset))
-            return {'total': total, 'items': [{'host': r['host'], 'sources': json.loads(r['sources'])} for r in rows]}
+            return {'total': total, 'items': [{'host': r['host'], 'sources': json.loads(r['sources']),
+                                             'ips': json.loads(r['ips']), 'dns_status': r['dns_status']} for r in rows]}
 
     def delete(self, scan_id):
         with self.connect() as db:

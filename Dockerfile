@@ -12,6 +12,8 @@ RUN apk add --no-cache ca-certificates \
     && chown app:app /data /config
 COPY --from=subfinder /go/bin/subfinder /usr/local/bin/subfinder
 WORKDIR /app
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 COPY --chown=app:app app ./app
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HOME=/tmp DATA_DIR=/data PORT=8080
 USER 10001:10001

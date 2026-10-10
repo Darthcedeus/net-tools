@@ -2,13 +2,18 @@ import http.client
 import json
 import os
 import tempfile
+import sqlite3
 import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.runner import Runner
+from app.resolver import resolve_host
+import dns.exception
+import dns.resolver
 from app.security import hash_password, normalize_domain, verify_password
 from app.server import Application, Server
 from app.store import Store
@@ -19,6 +24,38 @@ FIXTURE.chmod(0o755)
 PASSWORD = 'test-password-long-enough'
 HASH = hash_password(PASSWORD)
 OPTIONS = {'timeout': 5, 'max_time': 1, 'rate_limit': 10, 'all_sources': False, 'recursive': False}
+
+
+def fixture_addresses(host):
+    if host.startswith('docs.'):
+        return [], 'no_records'
+    if host.startswith('staging.'):
+        return [], 'timeout'
+    return ['192.0.2.10', '2001:db8::10'], 'resolved'
+
+
+class ResolverTests(unittest.TestCase):
+    def test_a_and_aaaa_deduplicate_sort_and_bound_requests(self):
+        with patch('app.resolver.dns.resolver.Resolver') as factory:
+            resolver = factory.return_value
+            resolver.resolve.side_effect = [[SimpleNamespace(address=a) for a in ['192.0.2.20', '192.0.2.10', '192.0.2.10']], [SimpleNamespace(address='2001:db8::10')]]
+            self.assertEqual(resolve_host('api.example.com'), (['192.0.2.10', '192.0.2.20', '2001:db8::10'], 'resolved'))
+            self.assertEqual(resolver.timeout, 1)
+            self.assertEqual(resolver.resolve.call_args_list[0].args, ('api.example.com.', 'A'))
+            self.assertEqual(resolver.resolve.call_args_list[1].args, ('api.example.com.', 'AAAA'))
+            for call in resolver.resolve.call_args_list:
+                self.assertEqual(call.kwargs, {'lifetime': 1.5, 'search': False})
+
+    def test_no_records_timeouts_and_failure_are_distinct(self):
+        for error, status in [(dns.resolver.NoAnswer(), 'no_records'), (dns.resolver.NXDOMAIN(), 'no_records'), (dns.exception.Timeout(), 'timeout'), (dns.resolver.NoNameservers(), 'error')]:
+            with self.subTest(status=status), patch('app.resolver.dns.resolver.Resolver') as factory:
+                factory.return_value.resolve.side_effect = error
+                self.assertEqual(resolve_host('api.example.com'), ([], status))
+
+    def test_partial_family_failure_preserves_addresses(self):
+        with patch('app.resolver.dns.resolver.Resolver') as factory:
+            factory.return_value.resolve.side_effect = [[SimpleNamespace(address='192.0.2.10')], dns.exception.Timeout()]
+            self.assertEqual(resolve_host('api.example.com'), (['192.0.2.10'], 'partial'))
 
 
 def wait_for(store, scan_id, predicate, timeout=5):
@@ -47,6 +84,23 @@ class SecurityTests(unittest.TestCase):
 
 
 class StoreTests(unittest.TestCase):
+    def test_migrates_original_database_and_retains_address_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'old.sqlite3'
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE results (scan_id TEXT NOT NULL, host TEXT NOT NULL, sources TEXT NOT NULL, PRIMARY KEY(scan_id,host))')
+                db.execute('INSERT INTO results VALUES (?,?,?)', ('legacy', 'old.example.com', '["crtsh"]'))
+            store = Store(path)
+            self.assertEqual(store.results('legacy')['items'][0]['dns_status'], 'not_checked')
+            self.assertEqual(store.results('legacy')['items'][0]['ips'], [])
+            store.create('new', 'example.com', OPTIONS)
+            store.add_result('new', 'api.example.com', ['crtsh'])
+            store.set_addresses('new', 'api.example.com', ['192.0.2.10', '2001:db8::10'], 'resolved')
+            store.add_result('new', 'api.example.com', ['other'])
+            reopened = Store(path)
+            self.assertEqual(reopened.results('new')['items'][0]['ips'], ['192.0.2.10', '2001:db8::10'])
+            self.assertEqual(reopened.results('new')['items'][0]['sources'], ['crtsh', 'other'])
+
     def test_restart_retains_partial_results_and_marks_interrupted(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'history.sqlite3'
@@ -79,7 +133,7 @@ class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.directory.name) / 'history.sqlite3')
-        self.runner = Runner(self.store, str(FIXTURE))
+        self.runner = Runner(self.store, str(FIXTURE), resolver=fixture_addresses)
 
     def tearDown(self):
         self.runner.close(); self.directory.cleanup()
@@ -91,6 +145,55 @@ class RunnerTests(unittest.TestCase):
         row = self.store.results(scan['id'])['items'][0]
         self.assertEqual(row['host'], 'api.example.com')
         self.assertEqual(row['sources'], ['another', 'crtsh', 'hackertarget'])
+        self.assertEqual(row['ips'], ['192.0.2.10', '2001:db8::10'])
+        self.assertEqual(row['dns_status'], 'resolved')
+
+    def test_resolves_only_unique_in_scope_hosts_and_isolates_dns_errors(self):
+        calls = []
+        def resolver(host):
+            calls.append(host)
+            if host.startswith('mail.'):
+                raise RuntimeError('resolver error')
+            return fixture_addresses(host)
+        self.runner.resolver = resolver
+        scan = self.runner.submit('example.com', OPTIONS)
+        wait_for(self.store, scan['id'], lambda s: s['status'] == 'completed')
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(set(calls)), 5)
+        self.assertTrue(all(h.endswith('.example.com') for h in calls))
+        rows = {r['host']: r for r in self.store.results(scan['id'])['items']}
+        self.assertEqual(rows['docs.example.com']['dns_status'], 'no_records')
+        self.assertEqual(rows['staging.example.com']['dns_status'], 'timeout')
+        self.assertEqual(rows['mail.example.com']['dns_status'], 'error')
+        self.assertFalse(any(r['dns_status'] == 'pending' for r in rows.values()))
+
+    def test_dns_concurrency_and_cancel_discard_queued_lookups(self):
+        fixture = Path(self.directory.name) / 'many.py'
+        fixture.write_text('#!/usr/bin/env python3\nimport json\nfor i in range(32):\n print(json.dumps({"host":f"host{i}.example.com","source":"crtsh"}), flush=True)\n')
+        fixture.chmod(0o755)
+        self.runner.binary = str(fixture)
+        release, eight_started = threading.Event(), threading.Event()
+        calls, lock = [], threading.Lock()
+        def blocked(host):
+            with lock:
+                calls.append(host)
+                if len(calls) == 8:
+                    eight_started.set()
+            release.wait(2)
+            return ['192.0.2.10'], 'resolved'
+        self.runner.resolver = blocked
+        scan = self.runner.submit('example.com', OPTIONS)
+        try:
+            self.assertTrue(eight_started.wait(2))
+            wait_for(self.store, scan['id'], lambda s: s['count'] == 32)
+            self.runner.cancel(scan['id'])
+        finally:
+            release.set()
+        wait_for(self.store, scan['id'], lambda s: s['status'] == 'cancelled')
+        self.assertEqual(len(calls), 8)
+        rows = self.store.results(scan['id'])['items']
+        self.assertEqual(sum(r['dns_status'] == 'cancelled' for r in rows), 24)
+        self.assertFalse(any(r['dns_status'] == 'pending' for r in rows))
 
     def test_cancel_keeps_live_results_and_queued_cancel(self):
         scan = self.runner.submit('slow.example', OPTIONS)
@@ -129,6 +232,8 @@ class APITests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.environment = patch.dict(os.environ, {'APP_ORIGIN': 'http://localhost:8080', 'APP_PASSWORD_HASH': HASH, 'DATA_DIR': self.directory.name, 'SUBFINDER_BIN': str(FIXTURE)})
         self.environment.start()
+        self.dns_patch = patch('app.runner.resolve_host', side_effect=fixture_addresses)
+        self.dns_patch.start()
         self.app = Application()
         self.server = Server(('127.0.0.1', 0), self.app)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -137,6 +242,7 @@ class APITests(unittest.TestCase):
     def tearDown(self):
         self.server.shutdown(); self.app.runner.close(); self.server.server_close()
         self.environment.stop(); self.directory.cleanup()
+        self.dns_patch.stop()
 
     def request(self, method, path, data=None, headers=None):
         connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
@@ -172,10 +278,15 @@ class APITests(unittest.TestCase):
         prefix = '/api/scans/' + scan['id']
         results = self.request('GET', prefix + '/results?q=api')[1]
         self.assertEqual(results['total'], 1)
+        self.assertEqual(results['items'][0]['ips'], ['192.0.2.10', '2001:db8::10'])
         self.assertEqual(self.request('GET', prefix + '/results?q=%25')[1]['total'], 0)
         self.assertEqual(len(self.request('GET', prefix + '/export?format=txt')[1].splitlines()), 5)
         self.assertEqual(self.request('GET', prefix + '/export?format=txt&q=api')[1], 'api.example.com\n')
         self.assertIn('subdomain,sources', self.request('GET', prefix + '/export?format=csv')[1])
+        csv_export = self.request('GET', prefix + '/export?format=csv')[1]
+        self.assertIn('ip_addresses,dns_status', csv_export)
+        self.assertIn('2001:db8::10', csv_export)
+        self.assertEqual(self.request('GET', prefix + '/export?format=json')[1]['results'][0]['ips'], ['192.0.2.10', '2001:db8::10'])
         self.assertEqual(len(self.request('GET', prefix + '/export?format=json')[1]['results']), 5)
         self.assertEqual(self.request('GET', prefix + '/export?format=html')[0], 400)
         self.assertEqual(self.request('DELETE', prefix)[0], 200)
