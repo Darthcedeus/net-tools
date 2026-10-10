@@ -32,15 +32,13 @@ curl http://127.0.0.1:8083/healthz
 
 The setup prompts for the exact public origin, such as `https://net-tools.humza.xyz`, and a password of at least 12 characters. It creates a private `.env` containing a PBKDF2 password hash. Never send your password or provider keys to anyone. The origin is used for browser request checks and secure cookies; update it if you change the hostname. The app is served at the hostname root, not under a subpath.
 
-Add this block to your host Caddyfile (usually `/etc/caddy/Caddyfile`), replacing the domain with the same hostname you entered during setup:
+Generate the Caddy site block from your existing `.env`:
 
-```caddyfile
-net-tools.humza.xyz {
-    encode zstd gzip
-    header Strict-Transport-Security "max-age=31536000"
-    reverse_proxy 127.0.0.1:8083
-}
+```sh
+python3 scripts/caddy_config.py
 ```
+
+Copy that output into your host Caddyfile (usually `/etc/caddy/Caddyfile`), replacing only the existing Net Tools block and keeping your other sites. The generated block contains a **private proxy token**; do not commit or share it. It does not change `.env`, your password, or saved scans. Caddy overwrites the token and client-IP headers on every request so the app can safely apply separate login limits to separate clients. Ordinary `X-Forwarded-For` headers are ignored. This assumes Caddy receives public traffic directly; a CDN in front requires a separately reviewed client-identity setup. The header syntax follows the [Caddy reverse proxy documentation](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy).
 
 Validate and reload Caddy:
 
@@ -55,17 +53,25 @@ Open your public URL on your computer or phone and sign in. Compose publishes ho
 
 Put Caddy and this service on a shared user-defined Docker network, remove the `ports` mapping from this service, and use `reverse_proxy subfinder:8080`. In a Caddy container, `127.0.0.1` refers to Caddy itself, not the Subfinder container. Keep Caddy's existing volumes for certificates. `APP_ORIGIN` stays the public HTTPS origin.
 
+Keep both `header_up` directives from the generated block when changing the upstream address.
+
 ### Update an existing deployment
 
 From the existing checkout on your VM:
 
 ```sh
 git pull --ff-only
+python3 scripts/caddy_config.py
+# Replace only the Net Tools site block in /etc/caddy/Caddyfile with that output.
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
 docker compose up -d --build
 curl http://127.0.0.1:8083/healthz
 ```
 
 Your existing `.env`, provider configuration, and saved scan volume are retained. You do not need to rerun setup if `APP_ORIGIN` already matches `https://net-tools.humza.xyz`. The service and volume keep their original `subfinder` / `subfinder-data` names to preserve deployed data.
+
+**The Caddy block update is required when installing the client-specific login-limit fix.** With the old block, clients still share Caddy's socket IP. Once installed, the generated block stays valid across pulls; regenerate it only after changing the password or public hostname.
 
 If Git refuses to pull because you previously edited `compose.yaml` to change the port, save that file and restore the tracked version before pulling. The updated version already includes `0.0.0.0:8083`:
 
@@ -93,7 +99,8 @@ Example credential shape: `shodan: ["your-key"]`. Providers such as Censys have 
 
 ## Operation
 
-- Password login is required for every scan, result, history, and export API. Sessions expire after 12 hours and are invalidated on app restart. Passwords use PBKDF2-SHA256 with a random salt and 600,000 iterations. Cookies are HttpOnly and SameSite=Strict; HTTPS origins add Secure. Mutations require an origin check and a session-specific CSRF token. Login is limited to 10 attempts per five minutes globally and per direct peer; forwarded headers cannot bypass this.
+- Password login is required for every scan, result, history, and export API. Sessions expire after 12 hours and are invalidated on app restart. Passwords use PBKDF2-SHA256 with a random salt and 600,000 iterations. Cookies are HttpOnly and SameSite=Strict; HTTPS origins add Secure. Mutations require an origin check and a session-specific CSRF token. Login is limited to 10 attempts per five minutes per client IP, with no shared five-minute lockout. Behind Caddy, the generated private token authenticates its client-IP header; direct requests use their socket IP. Devices sharing a public IP share the quota. At most two password verifications run concurrently; overload returns a temporary 503, without adding a login attempt. Tracking is bounded to 4,096 active client buckets.
+- HTTP connections close after one response and have a hard 15-second lifetime, including incomplete headers, body trickles, and slow response reads. Limits allow 48 connections overall, eight per socket peer, and four active API/page requests per authenticated proxy client IP or direct socket IP. One watchdog enforces deadlines without creating a timer thread per connection. Large downloads must finish within the connection deadline; scans continue independently. These resource bounds do not replace upstream protection against distributed denial of service.
 - One scan runs at a time; up to five more wait in the queue. Each scan has a configurable time limit (1–10 minutes), source timeout (5–60 seconds), and request rate (1–50/second). A hard wall-clock limit adds 30 seconds for cleanup. Results are capped at 10,000 per scan. Partial results survive cancellation, errors, timeouts, and restart.
 - Discovery uses passive Subfinder sources. As each unique hostname arrives, up to eight DNS workers look up A and AAAA records through the container’s configured resolver, with a three-second lookup budget per hostname and the overall scan deadline. This adds DNS queries, but no HTTP requests, connections to discovered hosts, or port scans. Addresses are a snapshot taken during that scan; DNS resolution does not prove a service is live. No-record, timeout, partial, failed, and cancelled lookups are labeled separately. Existing saved scans retain their results and show “Not checked” for IPs; rerun them to resolve addresses. Use it for domains you own or have permission to assess.
 - Scan records and results live in a SQLite database in the `subfinder-data` named volume. The latest 100 finished scans are retained, plus active jobs. Queued/running jobs become interrupted on restart and can be run again.
@@ -114,10 +121,12 @@ Health checks report that the web service is responding; the UI separately check
 
 ```sh
 python3 scripts/setup.py
+python3 scripts/caddy_config.py
+# Replace the Net Tools Caddy block, then validate and reload Caddy.
 docker compose up -d --force-recreate
 ```
 
-Recreating the container signs out existing sessions and retains saved results. Update Caddy and DNS too if the hostname changes.
+Recreating the container signs out existing sessions and retains saved results. The proxy token rotates with the password hash, so always regenerate the Caddy block after changing the password. Update DNS too if the hostname changes.
 
 ### Upgrade
 

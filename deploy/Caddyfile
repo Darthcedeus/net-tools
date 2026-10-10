@@ -3,5 +3,10 @@
 net-tools.humza.xyz {
     encode zstd gzip
     header Strict-Transport-Security "max-age=31536000"
-    reverse_proxy 127.0.0.1:8083
+    reverse_proxy 127.0.0.1:8083 {
+        # Render this template with python3 scripts/caddy_config.py.
+        # Overwrite both headers; never copy client-supplied forwarding values.
+        header_up X-Net-Tools-Proxy-Token {$NET_TOOLS_PROXY_TOKEN}
+        header_up X-Net-Tools-Client-IP {remote_host}
+    }
 }

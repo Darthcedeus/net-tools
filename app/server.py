@@ -1,6 +1,7 @@
 """Single-user Net Tools web service, intended to sit behind Caddy HTTPS."""
 import csv
 import io
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -8,6 +9,7 @@ import os
 import re
 import secrets
 import signal
+import socket
 import threading
 import time
 from collections import defaultdict, deque
@@ -17,7 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from app.runner import Runner
-from app.security import normalize_domain, verify_password
+from app.security import normalize_domain, proxy_token, verify_password
 from app.store import Store
 
 STATIC = Path(__file__).parent / 'static'
@@ -38,6 +40,8 @@ class Application:
         if not re.fullmatch(r'pbkdf2_sha256\$600000\$[0-9a-f]{32}\$[0-9a-f]{64}', self.password_hash):
             raise ValueError('Set APP_PASSWORD_HASH using scripts/setup.py before starting the application.')
         self.secure = parsed.scheme == 'https'
+        self.proxy_token = proxy_token(self.password_hash)
+        self.password_slots = threading.BoundedSemaphore(2)
         self.sessions = {}
         self.attempts = defaultdict(deque)
         self.lock = threading.RLock()
@@ -74,7 +78,19 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return ''
 
+    def client_key(self):
+        # Public backend ports make ordinary forwarding headers untrustworthy.
+        tokens = self.headers.get_all('X-Net-Tools-Proxy-Token', [])
+        addresses = self.headers.get_all('X-Net-Tools-Client-IP', [])
+        if len(tokens) == len(addresses) == 1 and tokens[0].isascii() and secrets.compare_digest(tokens[0], self.app.proxy_token):
+            try:
+                return str(ipaddress.ip_address(addresses[0]))
+            except ValueError:
+                raise APIError(400, 'Invalid proxy client address.') from None
+        return str(ipaddress.ip_address(self.client_address[0]))
+
     def send(self, status, body, content_type='application/json; charset=utf-8', headers=None):
+        self.close_connection = True
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
         elif isinstance(body, str):
@@ -82,6 +98,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection', 'close')
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('X-Frame-Options', 'DENY')
@@ -89,8 +106,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
         for key, value in (headers or {}).items():
             self.send_header(key, value)
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            # The deadline can close the socket before even an error is sent.
+            self.close_connection = True
 
     def body(self):
         if self.headers.get('Transfer-Encoding'):
@@ -141,19 +162,28 @@ class Handler(BaseHTTPRequestHandler):
             password = data.get('password', '')
             if not isinstance(password, str) or len(password) > 1024:
                 raise APIError(400, 'Invalid password.')
-            # Global + peer buckets prevent bypass through spoofed proxy headers.
+            # Only this client gets a cooldown; password work is separately bounded.
             with self.app.lock:
-                now = time.time()
-                for key in ('global', self.client_address[0]):
+                now = time.monotonic()
+                for key in list(self.app.attempts):
                     bucket = self.app.attempts[key]
-                    while bucket and bucket[0] < now - 300:
+                    while bucket and bucket[0] <= now - 300:
                         bucket.popleft()
-                    if len(bucket) >= 10:
-                        raise APIError(429, 'Too many sign-in attempts. Try again in five minutes.')
-                for key in ('global', self.client_address[0]):
-                    self.app.attempts[key].append(now)
-            if not verify_password(password, self.app.password_hash):
-                raise APIError(401, 'Incorrect password.')
+                    if not bucket:
+                        del self.app.attempts[key]
+                key = self.client_key()
+                if key not in self.app.attempts and len(self.app.attempts) >= 4096:
+                    raise APIError(503, 'Sign-in is busy. Try again shortly.')
+                if len(self.app.attempts[key]) >= 10:
+                    raise APIError(429, 'Too many sign-in attempts. Try again in five minutes.')
+                if not self.app.password_slots.acquire(blocking=False):
+                    raise APIError(503, 'Sign-in is busy. Try again shortly.')
+                self.app.attempts[key].append(now)
+            try:
+                if not verify_password(password, self.app.password_hash):
+                    raise APIError(401, 'Incorrect password.')
+            finally:
+                self.app.password_slots.release()
             token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
             with self.app.lock:
                 self.app.session('')
@@ -248,7 +278,12 @@ class Handler(BaseHTTPRequestHandler):
         raise APIError(404, 'Not found.')
 
     def handle_request(self):
+        client = None
         try:
+            client = self.client_key()
+            if not self.server.acquire_client(client):
+                client = None
+                raise APIError(429, 'Too many open requests from this client.')
             self.dispatch()
         except APIError as error:
             self.close_connection = True
@@ -257,11 +292,14 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self.send(400, {'error': str(error)})
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
-            pass
+            self.close_connection = True
         except Exception:
             logging.exception('Request failed')
             self.close_connection = True
             self.send(500, {'error': 'An unexpected error occurred. Check server logs.'})
+        finally:
+            if client is not None:
+                self.server.release_client(client)
 
     do_GET = handle_request
     do_POST = handle_request
@@ -271,11 +309,21 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 64
+    connection_lifetime = 15
+    peer_limit = 8
+    client_limit = 4
 
     def __init__(self, address, app):
         self.app = app
         self.slots = threading.BoundedSemaphore(48)
+        self.connection_lock = threading.Lock()
+        self.connections = {}
+        self.peers = defaultdict(int)
+        self.clients = defaultdict(int)
+        self.stopping = threading.Event()
         super().__init__(address, Handler)
+        self.reaper = threading.Thread(target=self.expire_connections, daemon=True)
+        self.reaper.start()
 
     def get_request(self):
         request, address = super().get_request()
@@ -286,17 +334,69 @@ class Server(ThreadingHTTPServer):
         if not self.slots.acquire(blocking=False):
             self.shutdown_request(request)
             return
+        peer = address[0]
+        with self.connection_lock:
+            if self.peers[peer] >= self.peer_limit:
+                self.slots.release()
+                self.shutdown_request(request)
+                return
+            self.peers[peer] += 1
+            self.connections[request] = (time.monotonic() + self.connection_lifetime, peer)
         try:
             super().process_request(request, address)
         except Exception:
-            self.slots.release()
+            self.finish_connection(request)
+            self.shutdown_request(request)
             raise
 
     def process_request_thread(self, request, address):
         try:
             super().process_request_thread(request, address)
         finally:
-            self.slots.release()
+            self.finish_connection(request)
+
+    def finish_connection(self, request):
+        with self.connection_lock:
+            _, peer = self.connections.pop(request)
+            self.peers[peer] -= 1
+            if not self.peers[peer]:
+                del self.peers[peer]
+        self.slots.release()
+
+    def acquire_client(self, client):
+        with self.connection_lock:
+            if self.clients[client] >= self.client_limit:
+                return False
+            self.clients[client] += 1
+            return True
+
+    def release_client(self, client):
+        with self.connection_lock:
+            self.clients[client] -= 1
+            if not self.clients[client]:
+                del self.clients[client]
+
+    def expire_connections(self):
+        # One watchdog bounds even buffered reads with continuously arriving bytes.
+        while not self.stopping.wait(0.05):
+            with self.connection_lock:
+                for request, (deadline, _) in self.connections.items():
+                    if time.monotonic() >= deadline:
+                        try:
+                            request.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+
+    def server_close(self):
+        self.stopping.set()
+        self.reaper.join()
+        with self.connection_lock:
+            for request in self.connections:
+                try:
+                    request.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        super().server_close()
 
 
 def main():

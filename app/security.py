@@ -23,6 +23,11 @@ def verify_password(password, encoded):
         return False
 
 
+def proxy_token(encoded):
+    """Separate proxy credential, rotated whenever the password hash changes."""
+    return hmac.new(encoded.encode(), b'net-tools/caddy-client-identity/v1', hashlib.sha256).hexdigest()
+
+
 def normalize_domain(value):
     if not isinstance(value, str) or len(value) > 253:
         raise ValueError('Enter a domain, such as example.com, without a URL or path.')

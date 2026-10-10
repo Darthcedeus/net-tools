@@ -1,6 +1,7 @@
 import http.client
 import json
 import os
+import socket
 import tempfile
 import sqlite3
 import threading
@@ -9,12 +10,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from collections import deque
 
 from app.runner import Runner
 from app.resolver import resolve_host
 import dns.exception
 import dns.resolver
-from app.security import hash_password, normalize_domain, verify_password
+from app.security import hash_password, normalize_domain, proxy_token, verify_password
 from app.server import Application, Server
 from app.store import Store
 
@@ -299,9 +301,159 @@ class APITests(unittest.TestCase):
                 self.assertEqual(self.request('POST', '/api/scans', body)[0], 400)
 
     def test_login_rate_limit(self):
+        attacker = {'X-Net-Tools-Proxy-Token': self.app.proxy_token, 'X-Net-Tools-Client-IP': '192.0.2.1'}
         for _ in range(10):
-            self.assertEqual(self.request('POST', '/api/login', {'password': 'bad'})[0], 401)
+            self.assertEqual(self.request('POST', '/api/login', {'password': 'bad'}, attacker)[0], 401)
+        self.assertEqual(self.request('POST', '/api/login', {'password': PASSWORD}, attacker)[0], 429)
+        owner = {**attacker, 'X-Net-Tools-Client-IP': '192.0.2.2'}
+        self.assertEqual(self.request('POST', '/api/login', {'password': PASSWORD}, owner)[0], 200)
+        # A direct client with forged forwarding headers still uses its socket IP.
+        for i in range(10):
+            spoofed = {'X-Forwarded-For': f'198.51.100.{i}', 'X-Net-Tools-Client-IP': f'198.51.100.{i}', 'X-Net-Tools-Proxy-Token': 'forged'}
+            self.assertEqual(self.request('POST', '/api/login', {'password': 'bad'}, spoofed)[0], 401)
         self.assertEqual(self.request('POST', '/api/login', {'password': PASSWORD})[0], 429)
+        self.assertEqual(self.request('POST', '/api/login', {'password': PASSWORD}, owner)[0], 200)
+
+    def test_proxy_validation_and_password_work_capacity(self):
+        signed = {'X-Net-Tools-Proxy-Token': self.app.proxy_token, 'X-Net-Tools-Client-IP': 'not-an-ip'}
+        self.assertEqual(self.request('POST', '/api/login', {'password': PASSWORD}, signed)[0], 400)
+        for _ in range(2):
+            self.app.password_slots.acquire()
+        try:
+            self.assertEqual(self.request('POST', '/api/login', {'password': PASSWORD})[0], 503)
+            self.assertEqual(self.request('GET', '/healthz')[0], 200)
+        finally:
+            for _ in range(2):
+                self.app.password_slots.release()
+        self.login()
+
+    def test_duplicate_proxy_headers_cannot_change_identity(self):
+        connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
+        connection.putrequest('GET', '/healthz')
+        connection.putheader('X-Net-Tools-Proxy-Token', self.app.proxy_token)
+        connection.putheader('X-Net-Tools-Proxy-Token', self.app.proxy_token)
+        connection.putheader('X-Net-Tools-Client-IP', '192.0.2.1')
+        # If the duplicate token were accepted this limit would return 429.
+        with self.server.connection_lock:
+            self.server.clients['192.0.2.1'] = self.server.client_limit
+        try:
+            connection.endheaders()
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+        finally:
+            connection.close()
+            with self.server.connection_lock:
+                self.server.clients.pop('192.0.2.1', None)
+
+    def test_login_buckets_expire_and_ipv6_aliases_share_quota(self):
+        now = time.monotonic()
+        with self.app.lock:
+            self.app.attempts['2001:db8::1'] = deque([now] * 10)
+        signed = {'X-Net-Tools-Proxy-Token': self.app.proxy_token, 'X-Net-Tools-Client-IP': '2001:0db8:0:0:0:0:0:1'}
+        self.assertEqual(self.request('POST', '/api/login', {'password': PASSWORD}, signed)[0], 429)
+        with self.app.lock:
+            self.app.attempts['2001:db8::1'] = deque([now - 301] * 10)
+        self.assertEqual(self.request('POST', '/api/login', {'password': PASSWORD}, signed)[0], 200)
+
+    def test_login_tracking_is_bounded_and_recovers_after_expiry(self):
+        now = time.monotonic()
+        with self.app.lock:
+            self.app.attempts.update({f'client-{i}': deque([now]) for i in range(4096)})
+        self.assertEqual(self.request('POST', '/api/login', {'password': PASSWORD})[0], 503)
+        with self.app.lock:
+            self.assertEqual(len(self.app.attempts), 4096)
+            for bucket in self.app.attempts.values():
+                bucket[0] = now - 301
+        self.login()
+
+    def test_caddy_configuration_uses_matching_private_token(self):
+        from scripts.caddy_config import render
+        block = render(f"APP_ORIGIN='https://net-tools.humza.xyz'\nAPP_PASSWORD_HASH='{HASH}'\n")
+        self.assertIn('header_up X-Net-Tools-Proxy-Token ' + proxy_token(HASH), block)
+        self.assertIn('header_up X-Net-Tools-Client-IP {remote_host}', block)
+        self.assertNotIn(HASH, block)
+        self.assertNotEqual(proxy_token(HASH), proxy_token(hash_password(PASSWORD)))
+
+    def test_successful_request_closes_persistent_socket(self):
+        connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
+        connection.request('GET', '/healthz')
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader('Connection'), 'close')
+        response.read()
+        self.assertIsNone(connection.sock)
+        connection.close()
+        with socket.create_connection(self.server.server_address, timeout=2) as wire:
+            wire.sendall(b'GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n')
+            response = b''
+            while chunk := wire.recv(4096):
+                response += chunk
+            self.assertIn(b'200 OK', response)
+            self.assertIn(b'Connection: close', response)
+
+    def test_absolute_deadline_bounds_trickling_headers_and_bodies(self):
+        self.server.connection_lifetime = 0.35
+        for prefix in [b'GET /healthz HTTP/1.1\r\nX-Slow: ',
+                       (f'POST /api/login HTTP/1.1\r\nOrigin: {self.app.origin}\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n').encode()]:
+            with self.subTest(prefix=prefix), socket.create_connection(self.server.server_address, timeout=2) as connection:
+                connection.sendall(prefix)
+                started = time.monotonic()
+                for _ in range(15):
+                    time.sleep(0.04)
+                    try:
+                        connection.sendall(b' ')
+                    except OSError:
+                        break
+                received = b''
+                try:
+                    while chunk := connection.recv(4096):
+                        received += chunk
+                except ConnectionResetError:
+                    pass
+                self.assertLess(time.monotonic() - started, 1.2)
+        self.assertEqual(self.request('GET', '/healthz')[0], 200)
+
+    def test_slow_client_cannot_fill_all_workers(self):
+        self.server.connection_lifetime = 1
+        connections = []
+        try:
+            for _ in range(self.server.peer_limit + 3):
+                connection = socket.create_connection(self.server.server_address, timeout=2)
+                connections.append(connection)
+                try:
+                    connection.sendall(b'GET /healthz HTTP/1.1\r\nX-Slow: ')
+                except OSError:
+                    pass
+            time.sleep(0.1)
+            with self.server.connection_lock:
+                self.assertLessEqual(len(self.server.connections), self.server.peer_limit)
+            # Hard deadline frees the admitted connections, even without EOF.
+            time.sleep(1.1)
+            self.assertEqual(self.request('GET', '/healthz')[0], 200)
+        finally:
+            for connection in connections:
+                connection.close()
+
+    def test_proxied_slow_bodies_leave_capacity_for_another_client(self):
+        connections = []
+        try:
+            for _ in range(self.server.client_limit):
+                connection = socket.create_connection(self.server.server_address, timeout=2)
+                connections.append(connection)
+                connection.sendall((f'POST /api/login HTTP/1.1\r\nOrigin: {self.app.origin}\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nX-Net-Tools-Proxy-Token: {self.app.proxy_token}\r\nX-Net-Tools-Client-IP: 192.0.2.1\r\n\r\n').encode())
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                with self.server.connection_lock:
+                    if self.server.clients.get('192.0.2.1') == self.server.client_limit:
+                        break
+                time.sleep(0.01)
+            signed = {'X-Net-Tools-Proxy-Token': self.app.proxy_token, 'X-Net-Tools-Client-IP': '192.0.2.1'}
+            self.assertEqual(self.request('GET', '/healthz', headers=signed)[0], 429)
+            self.assertEqual(self.request('POST', '/api/login', {'password': PASSWORD}, {**signed, 'X-Net-Tools-Client-IP': '192.0.2.2'})[0], 200)
+        finally:
+            for connection in connections:
+                connection.close()
 
     def test_keep_alive_consumes_cancel_and_logout_bodies(self):
         self.login()
