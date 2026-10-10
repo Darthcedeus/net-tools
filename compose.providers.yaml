@@ -1,0 +1,7 @@
+# Optional overlay: docker compose -f compose.yaml -f compose.providers.yaml up -d --build
+services:
+  subfinder:
+    environment:
+      SUBFINDER_PROVIDER_CONFIG: /config/provider-config.yaml
+    volumes:
+      - ./config/provider-config.yaml:/config/provider-config.yaml:ro

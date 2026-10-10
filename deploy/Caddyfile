@@ -1,0 +1,7 @@
+# Replace this hostname with the one entered in scripts/setup.py.
+# This configuration assumes Caddy is installed on the Ubuntu host.
+subfinder.example.com {
+    encode zstd gzip
+    header Strict-Transport-Security "max-age=31536000"
+    reverse_proxy 127.0.0.1:8080
+}

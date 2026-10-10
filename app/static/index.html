@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1118">
+  <meta name="description" content="Your private, self-hosted workspace for passive subdomain discovery.">
+  <title>Subfinder · Discovery</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="header">
+    <div class="header-inner">
+      <a class="brand" href="/" aria-label="Subfinder home"><img src="/favicon.svg" width="32" height="32" alt=""><span>Subfinder</span></a>
+      <nav id="navigation" aria-label="Main navigation" hidden>
+        <button class="nav-item selected" id="discovery-tab" aria-current="page">Discovery</button>
+        <button class="nav-item" id="history-tab">History</button>
+      </nav>
+      <button class="sign-out" id="logout" hidden>Sign out</button>
+    </div>
+  </header>
+  <main>
+    <div id="boot" class="boot" role="status">Opening your workspace…</div>
+    <section id="login-view" class="login-view" hidden>
+      <div class="intro"><h1>Your discovery workspace.</h1><p>Sign in to your private Subfinder instance.</p></div>
+      <form id="login-form" class="panel login-panel">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required maxlength="1024" placeholder="Enter your password">
+        <p id="login-error" class="error" role="alert" hidden></p>
+        <button id="login-button" class="button primary" type="submit">Sign in <span aria-hidden="true">→</span></button>
+        <p class="login-note">A private view of your domains.</p>
+      </form>
+    </section>
+    <div id="workspace" hidden>
+      <p id="app-error" class="notice error" role="alert" hidden></p>
+      <section id="discovery-view">
+        <div class="intro"><h1>Discover what’s beneath.</h1><p>Find subdomains from passive sources. One domain, a clearer picture.</p></div>
+        <form id="scan-form" class="panel scan-panel">
+          <label for="domain">Target domain</label>
+          <div class="target-row"><input id="domain" type="text" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" required maxlength="253" placeholder="example.com"><button id="start" class="button primary" type="submit">Start discovery</button></div>
+          <details class="advanced"><summary>Advanced options</summary>
+            <div class="options">
+              <label>Time limit <span class="unit">minutes</span><input id="max-time" type="number" min="1" max="10" value="5" required></label>
+              <label>Source timeout <span class="unit">seconds</span><input id="timeout" type="number" min="5" max="60" value="30" required></label>
+              <label>Request rate <span class="unit">per second</span><input id="rate-limit" type="number" min="1" max="50" value="10" required></label>
+            </div>
+            <div class="checks"><label><input id="all-sources" type="checkbox">Use all sources <span class="muted">(may take longer)</span></label><label><input id="recursive" type="checkbox">Recursive-capable sources only</label></div>
+            <p class="help">Some sources need API keys. Configure them on your server using the provider configuration file.</p>
+          </details>
+          <div class="form-foot">Passive discovery · Powered by <a href="https://github.com/projectdiscovery/subfinder" target="_blank" rel="noopener noreferrer">ProjectDiscovery</a></div>
+        </form>
+        <section class="results-section" aria-labelledby="results-title">
+          <div class="section-top"><h2 id="results-title">Discovery results</h2><span id="scan-status" class="status" hidden></span></div>
+          <div class="scan-summary" id="scan-summary" hidden><div><p>Domain: <strong id="scan-domain" class="mono"></strong></p><p class="muted" id="scan-stats"></p></div><div class="scan-actions"><button class="button small" id="rerun">Run again</button><button class="button small danger" id="cancel" hidden>Cancel scan</button></div></div>
+          <p id="scan-note" class="notice" role="status" hidden></p>
+          <div id="result-tools" class="toolbar" hidden>
+            <div class="search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m16 16 4.5 4.5"></path></svg><input id="filter" aria-label="Filter subdomains" placeholder="Filter subdomains…" autocomplete="off" spellcheck="false"></div>
+            <button class="button" id="copy"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="3" width="12" height="15" rx="2"></rect><path d="M15 21H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2"></path></svg>Copy</button>
+            <select id="export" class="button" aria-label="Export results"><option value="">Export</option><option value="txt">Text (.txt)</option><option value="csv">CSV (.csv)</option><option value="json">JSON (.json)</option></select>
+          </div>
+          <div class="result-table" id="result-table" hidden><table><thead><tr><th scope="col">Subdomain</th><th scope="col">Sources</th></tr></thead><tbody id="result-rows"></tbody></table></div>
+          <div id="empty" class="empty"><img src="/favicon.svg" alt="" width="44" height="44"><h3>A clearer picture starts here.</h3><p>Enter a domain above to discover its subdomains.</p></div>
+          <div id="pagination" class="pagination" hidden><span class="muted" id="page-label"></span><div><button class="button small" id="previous">Previous</button><button class="button small" id="next">Next</button></div></div>
+        </section>
+      </section>
+      <section id="history-view" hidden>
+        <div class="intro"><h1>Your discoveries.</h1><p>Pick up where you left off. Your latest 100 finished scans are saved here.</p></div>
+        <div class="section-top history-heading"><h2>Scan history</h2><button id="refresh-history" class="button small">Refresh</button></div>
+        <div id="history-list" class="history-list"></div>
+        <div id="history-empty" class="empty" hidden><img src="/favicon.svg" alt="" width="44" height="44"><h3>A fresh workspace.</h3><p>Your scans will appear here as you discover domains.</p><button id="first-scan" class="button primary">Start a discovery</button></div>
+      </section>
+      <footer>Self-hosted. Your history stays on your server.<span>Subfinder GUI</span></footer>
+    </div>
+  </main>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

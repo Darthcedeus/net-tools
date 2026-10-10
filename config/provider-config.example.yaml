@@ -1,0 +1,9 @@
+# Copy to provider-config.yaml and add the keys you already have.
+# Keep provider-config.yaml private; it is excluded from Git and Docker builds.
+# See https://docs.projectdiscovery.io/opensource/subfinder/install#post-install-configuration
+# Subfinder supports additional providers and provider-specific credential formats.
+github: []
+shodan: []
+virustotal: []
+securitytrails: []
+censys: []

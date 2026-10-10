@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+config
+data
+tests
+scripts
+docs
+__pycache__
+*.pyc
+README.md
+*.sqlite3*
+node_modules
+output
+.DS_Store

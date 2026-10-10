@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+config/provider-config.yaml
+data/
+__pycache__/
+*.pyc
+*.sqlite3*
+.venv/
+node_modules/
+.DS_Store
