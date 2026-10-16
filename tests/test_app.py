@@ -515,5 +515,267 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.request('GET', '/api/scans')[1][0]['tool'], 'subdomains')
 
 
+from urllib.parse import parse_qs
+from app import salesforce
+from app.salesforce import Detector, FetchResult, safe_target
+from app.sf_runner import SalesforceRunner
+
+
+def aura(actions, context_fwuid=None):
+    """Build a fake Aura response for the given list of (descriptor-hint, payload)."""
+    body = {'actions': [{'id': str(i), 'descriptor': descriptor, **payload}
+                        for i, (descriptor, payload) in enumerate(actions)]}
+    return FetchResult(200, {}, json.dumps(body).encode(), 'https://x/aura')
+
+
+def sf_fetch(landing='', object_data=None, locked=False, require_fwuid=None, aura_live=True):
+    """A fake fetch for the Detector.
+
+    object_data maps object name -> (totalCount, [records]). Objects absent from
+    the map respond with an ERROR action (no guest access). When aura_live is
+    False, the Aura endpoint responds like a non-Salesforce site (404 HTML).
+    """
+    object_data = object_data or {}
+
+    def fetch(method, url, headers=None, data=None, timeout=10, max_bytes=0):
+        if method == 'GET':
+            return FetchResult(200, {}, landing.encode(), url)
+        if not aura_live:
+            return FetchResult(404, {}, b'<html>Not found</html>', url)
+        params = parse_qs(data.decode())
+        context = json.loads(params['aura.context'][0])
+        message = json.loads(params['message'][0])
+        descriptor = message['actions'][0]['descriptor']
+        params0 = message['actions'][0].get('params', {})
+        if require_fwuid and context.get('fwuid') != require_fwuid:
+            body = json.dumps({'actions': [], 'event': 'aura:clientOutOfSync',
+                               'newFwuid': require_fwuid}).encode()
+            return FetchResult(200, {}, body, url)
+        if 'getConfigData' in descriptor:
+            return aura([(descriptor, {'state': 'SUCCESS', 'returnValue': {
+                'apiNamesToKeyPrefixes': {'Account': '001', 'Secret__c': 'a01'}}})])
+        if 'getItems' in descriptor:
+            name = params0.get('entityNameOrId')
+            if locked or name not in object_data:
+                return aura([(descriptor, {'state': 'ERROR', 'error': [{'message': 'denied'}]})])
+            total, records = object_data[name]
+            return aura([(descriptor, {'state': 'SUCCESS', 'returnValue': {
+                'totalCount': total, 'result': records}})])
+        return FetchResult(500, {}, b'{}', url)
+    return fetch
+
+
+LANDING = ('<html><script>window.Aura={};var x="/auraFW/javascript/FWUID123/";'
+           '"fwuid":"FWUID123","app":"siteforce:communityApp",'
+           '"APPLICATION@markup://siteforce:communityApp":"APPID1"</script>'
+           'siteforce:communityApp SelfRegister "apiName":"Custom__c"</html>')
+
+
+class SalesforceSafeTargetTests(unittest.TestCase):
+    def test_rejects_private_loopback_ip_scheme_and_credentials(self):
+        for bad in ['http://localhost/', 'https://127.0.0.1', 'https://10.0.0.1',
+                    'http://169.254.169.254/', 'ftp://example.com',
+                    'https://user:pass@example.com', '', '   ']:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                safe_target(bad)
+
+    def test_normalizes_public_host(self):
+        with patch('app.salesforce._addresses_are_public'):
+            self.assertEqual(safe_target('community.example.com/path?q=1'), 'https://community.example.com')
+            self.assertEqual(safe_target('http://example.org:8080'), 'http://example.org:8080')
+
+
+class SalesforceDetectorTests(unittest.TestCase):
+    def setUp(self):
+        self.public = patch('app.salesforce._addresses_are_public'); self.public.start()
+
+    def tearDown(self):
+        self.public.stop()
+
+    def run_detector(self, fetch, **kwargs):
+        findings, meta = [], {}
+        detector = Detector(fetch=fetch, **kwargs)
+
+        def emit(kind, payload):
+            (findings.append(payload) if kind == 'finding' else meta.update(payload))
+        summary = detector.run('https://community.example.com', lambda: False, emit)
+        return summary, findings
+
+    def test_not_salesforce(self):
+        summary, findings = self.run_detector(sf_fetch(landing='<html>plain site</html>', aura_live=False))
+        self.assertFalse(summary['is_salesforce'])
+        self.assertEqual(summary['verdict'], 'not_salesforce')
+        self.assertEqual(findings, [])
+
+    def test_salesforce_locked_down(self):
+        summary, findings = self.run_detector(sf_fetch(landing=LANDING, locked=True))
+        self.assertTrue(summary['is_salesforce'])
+        self.assertEqual(summary['verdict'], 'salesforce')
+        self.assertEqual(summary['objects_readable'], 0)
+        self.assertTrue(all(not f['readable'] for f in findings))
+
+    def test_leaking_records_and_samples(self):
+        records = [{'Id': '001x%02d' % i, 'Name': 'Acme %d' % i} for i in range(20)]
+        fetch = sf_fetch(landing=LANDING, object_data={'Account': (42, records)})
+        summary, findings = self.run_detector(fetch, sample_size=10)
+        self.assertEqual(summary['verdict'], 'leaking')
+        self.assertGreaterEqual(summary['objects_readable'], 1)
+        account = next(f for f in findings if f['object'] == 'Account')
+        self.assertTrue(account['readable'])
+        self.assertEqual(account['record_count'], 42)
+        self.assertEqual(len(account['samples']), 10)
+        self.assertEqual(account['samples'][0]['Name'], 'Acme 0')
+
+    def test_sample_fields_and_values_are_truncated(self):
+        record = {'Big': 'x' * 500, 'Nested': {'value': 'y' * 500},
+                  **{'f%d' % i: i for i in range(40)}}
+        fetch = sf_fetch(landing=LANDING, object_data={'Account': (1, [record])})
+        _, findings = self.run_detector(fetch)
+        sample = next(f for f in findings if f['object'] == 'Account')['samples'][0]
+        self.assertLessEqual(len(sample), salesforce.SAMPLE_FIELD_LIMIT)
+        self.assertLessEqual(len(sample['Big']), salesforce.SAMPLE_VALUE_LIMIT)
+        # A nested field value is flattened to a truncated string, not kept as an object.
+        self.assertIsInstance(sample['Nested'], str)
+        self.assertLessEqual(len(sample['Nested']), salesforce.SAMPLE_VALUE_LIMIT)
+
+    def test_fwuid_refresh_recovers_object_list(self):
+        fetch = sf_fetch(landing='<html>window.Aura siteforce:communityApp</html>',
+                         object_data={'Account': (3, [{'Id': '001', 'Name': 'A'}])},
+                         require_fwuid='NEWFW')
+        summary, findings = self.run_detector(fetch)
+        self.assertTrue(summary['is_salesforce'])
+        self.assertEqual(summary['fwuid'], 'NEWFW')
+        self.assertEqual(summary['verdict'], 'leaking')
+
+    def test_cancel_stops_before_probing(self):
+        detector = Detector(fetch=sf_fetch(landing=LANDING, object_data={'Account': (1, [{'Id': '1'}])}))
+        findings = []
+        detector.run('https://community.example.com', lambda: True,
+                     lambda kind, payload: findings.append(payload) if kind == 'finding' else None)
+        self.assertEqual(findings, [])
+
+
+class SalesforceStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.directory.name) / 'scans.sqlite3')
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_create_findings_and_activity_merge(self):
+        self.store.sf_create('a' * 32, 'https://community.example.com', {'sample_size': 10, 'max_objects': 50})
+        scan = self.store.sf_get('a' * 32)
+        self.assertEqual(scan['tool'], 'salesforce')
+        self.assertEqual(scan['status'], 'queued')
+        self.store.sf_set_summary('a' * 32, {'verdict': 'leaking', 'is_salesforce': True,
+                                             'aura_endpoint': 'https://community.example.com/aura'})
+        self.store.sf_add_finding('a' * 32, {'object': 'Account', 'key_prefix': '001',
+                                            'readable': True, 'record_count': 5, 'samples': [{'Id': '1'}]})
+        self.store.sf_add_finding('a' * 32, {'object': 'Lead', 'readable': False, 'record_count': None, 'samples': []})
+        scan = self.store.sf_get('a' * 32)
+        self.assertEqual(scan['count'], 1)
+        self.assertTrue(scan['is_salesforce'])
+        readable = self.store.sf_findings('a' * 32, readable_only=True)
+        self.assertEqual(readable['total'], 1)
+        self.assertEqual(readable['items'][0]['object'], 'Account')
+        self.assertEqual(self.store.sf_findings('a' * 32, query='lea')['total'], 1)
+        # Combined activity includes both tools, newest first.
+        self.store.create('b' * 32, 'example.com', {'timeout': 5})
+        activity = self.store.activity()
+        self.assertEqual({item['tool'] for item in activity}, {'salesforce', 'subdomains'})
+        sf_item = next(item for item in activity if item['tool'] == 'salesforce')
+        self.assertEqual(sf_item['verdict'], 'leaking')
+        self.assertEqual(sf_item['label'], 'https://community.example.com')
+
+    def test_not_salesforce_activity_verdict(self):
+        self.store.sf_create('c' * 32, 'https://plain.example.com', {})
+        self.store.sf_set_summary('c' * 32, {'verdict': 'not_salesforce', 'is_salesforce': False})
+        item = next(i for i in self.store.activity() if i['tool'] == 'salesforce')
+        self.assertEqual(item['verdict'], 'not_salesforce')
+
+
+class SalesforceAPITests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.environment = patch.dict(os.environ, {'APP_ORIGIN': 'http://localhost:8080', 'APP_PASSWORD_HASH': HASH, 'DATA_DIR': self.directory.name, 'SUBFINDER_BIN': str(FIXTURE)})
+        self.environment.start()
+        self.public = patch('app.salesforce._addresses_are_public'); self.public.start()
+        self.app = Application()
+        records = [{'Id': '001x%02d' % i, 'Name': 'Acme %d' % i} for i in range(12)]
+        self.app.sf_runner.detector = Detector(fetch=sf_fetch(landing=LANDING, object_data={'Account': (42, records)}))
+        self.server = Server(('127.0.0.1', 0), self.app)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start(); self.cookie = ''; self.csrf = ''
+
+    def tearDown(self):
+        self.server.shutdown(); self.app.runner.close(); self.app.sf_runner.close(); self.server.server_close()
+        self.public.stop(); self.environment.stop(); self.directory.cleanup()
+
+    def request(self, method, path, data=None, headers=None):
+        connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
+        body = json.dumps(data) if data is not None else None
+        default = {'Origin': self.app.origin, 'Content-Type': 'application/json', 'Cookie': self.cookie, 'X-CSRF-Token': self.csrf}
+        connection.request(method, path, body=body, headers={**default, **(headers or {})})
+        response = connection.getresponse(); raw = response.read().decode(); status = response.status
+        response_headers = dict(response.getheaders())
+        connection.close()
+        return status, json.loads(raw) if 'application/json' in response_headers.get('Content-Type', '') else raw, response_headers
+
+    def login(self):
+        status, data, headers = self.request('POST', '/api/login', {'password': PASSWORD})
+        self.cookie = headers['Set-Cookie'].split(';')[0]; self.csrf = data['csrf']
+
+    def wait_sf(self, scan_id, predicate, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            scan = self.app.store.sf_get(scan_id)
+            if predicate(scan):
+                return scan
+            time.sleep(0.02)
+        raise AssertionError(f'SF scan did not reach expected state: {self.app.store.sf_get(scan_id)}')
+
+    def test_auth_csrf_and_url_validation(self):
+        self.assertEqual(self.request('GET', '/api/sf-scans')[0], 401)
+        self.assertEqual(self.request('GET', '/api/activity')[0], 401)
+        self.login()
+        # CSRF and origin are enforced on mutation.
+        self.assertEqual(self.request('POST', '/api/sf-scans', {'url': 'community.example.com'}, {'X-CSRF-Token': ''})[0], 403)
+        # SSRF / input validation rejects non-public or malformed targets.
+        with patch('app.salesforce._addresses_are_public', side_effect=ValueError('private')):
+            self.assertEqual(self.request('POST', '/api/sf-scans', {'url': 'http://169.254.169.254/'})[0], 400)
+        for body in [{'url': 'ftp://example.com'}, {'url': 'community.example.com', 'sample_size': 99},
+                     {'url': 'community.example.com', 'max_objects': 0}, {'url': 123}]:
+            with self.subTest(body=body):
+                self.assertEqual(self.request('POST', '/api/sf-scans', body)[0], 400)
+
+    def test_scan_lifecycle_findings_export_and_activity(self):
+        self.login()
+        status, scan, _ = self.request('POST', '/api/sf-scans', {'url': 'https://community.example.com', 'sample_size': 10, 'max_objects': 50})
+        self.assertEqual(status, 201)
+        self.assertEqual(scan['tool'], 'salesforce')
+        self.wait_sf(scan['id'], lambda s: s['status'] == 'completed')
+        scan = self.request('GET', '/api/sf-scans/' + scan['id'])[1]
+        self.assertEqual(scan['verdict'], 'leaking')
+        self.assertTrue(scan['is_salesforce'])
+        prefix = '/api/sf-scans/' + scan['id']
+        findings = self.request('GET', prefix + '/findings?readable=1')[1]
+        account = next(f for f in findings['items'] if f['object'] == 'Account')
+        self.assertEqual(account['record_count'], 42)
+        self.assertEqual(len(account['samples']), 10)
+        self.assertEqual(self.request('GET', prefix + '/findings?q=accou')[1]['items'][0]['object'], 'Account')
+        self.assertIn('object,key_prefix', self.request('GET', prefix + '/export?format=csv')[1])
+        self.assertEqual(self.request('GET', prefix + '/export?format=json')[1]['scan']['verdict'], 'leaking')
+        self.assertEqual(self.request('GET', prefix + '/export?format=html')[0], 400)
+        # The shared activity feed surfaces the Salesforce scan with its verdict.
+        activity = self.request('GET', '/api/activity')[1]
+        self.assertTrue(any(i['tool'] == 'salesforce' and i['verdict'] == 'leaking' for i in activity))
+        self.assertEqual(self.request('DELETE', prefix)[0], 200)
+        self.assertEqual(self.request('GET', prefix)[0], 404)
+
+    def test_salesforce_page_is_served(self):
+        self.assertEqual(self.request('GET', '/tools/salesforce')[0], 200)
+
+
 if __name__ == '__main__':
     unittest.main()

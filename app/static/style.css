@@ -1022,3 +1022,82 @@ footer {
     font-size:14px;
   }
 }
+
+/* Salesforce Detector */
+.status.leaking {
+  color:#ffb4a0;
+}
+.status.leaking::before {
+  background:#f0795a;
+}
+.status.verdict-leaking {
+  color:#ffb4a0;
+}
+.status.verdict-leaking::before {
+  background:#f0795a;
+}
+.status.verdict-ok {
+  color:#f0c46a;
+}
+.status.verdict-ok::before {
+  background:#d9a63f;
+}
+.status.verdict-none {
+  color:#8293aa;
+}
+.status.verdict-none::before {
+  background:#8293aa;
+}
+.notice.verdict-leaking {
+  border-color:#7a3b2e;
+  background:#2c1a16;
+  color:#ffd0c2;
+}
+.notice.verdict-ok {
+  border-color:#6b5a2d;
+  background:#272016;
+  color:#f2dca9;
+}
+.notice.verdict-none {
+  border-color:#314459;
+  background:#142332;
+}
+.sf-readable-toggle {
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
+  font-size:13px;
+  color:var(--muted);
+  white-space:nowrap;
+}
+.sf-readable-toggle input {
+  accent-color:var(--accent);
+}
+td>details>summary {
+  cursor:pointer;
+  color:var(--accent);
+  font-size:13px;
+}
+.sample-card {
+  border:1px solid var(--line);
+  border-radius:6px;
+  background:#0e1620;
+  padding:8px 10px;
+  margin-top:8px;
+}
+.sample-field {
+  display:flex;
+  gap:8px;
+  font-size:12px;
+  line-height:1.6;
+  overflow-wrap:anywhere;
+}
+.sample-key {
+  color:var(--muted);
+  min-width:120px;
+  flex-shrink:0;
+}
+.sample-value {
+  color:var(--text);
+  overflow-wrap:anywhere;
+}

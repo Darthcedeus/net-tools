@@ -17,6 +17,7 @@
       <nav id="navigation" aria-label="Main navigation" hidden>
         <a class="nav-item" href="/" data-route="home" id="home-tab">Home</a>
         <a class="nav-item" href="/tools/subdomains" data-route="discovery" id="discovery-tab">Subdomains</a>
+        <a class="nav-item" href="/tools/salesforce" data-route="salesforce" id="salesforce-tab">Salesforce</a>
         <a class="nav-item" href="/activity" data-route="history" id="history-tab">Activity</a>
       </nav>
       <button class="sign-out" id="logout" hidden>Sign out</button>
@@ -76,6 +77,35 @@
           <div class="result-table" id="result-table" hidden><table><thead><tr><th scope="col">Subdomain</th><th scope="col">IP addresses</th><th scope="col">Sources</th></tr></thead><tbody id="result-rows"></tbody></table></div>
           <div id="empty" class="empty"><img src="/favicon.svg" alt="" width="44" height="44"><h3>A clearer picture starts here.</h3><p>Enter a domain above to discover its subdomains.</p></div>
           <div id="pagination" class="pagination" hidden><span class="muted" id="page-label"></span><div><button class="button small" id="previous">Previous</button><button class="button small" id="next">Next</button></div></div>
+        </section>
+      </section>
+      <section id="salesforce-view" hidden>
+        <div class="intro"><h1 tabindex="-1">Salesforce Detector</h1><p>Detect Salesforce Aura/Lightning sites that leak data to guest users. Only scan sites you own or are authorized to test.</p></div>
+        <form id="sf-form" class="panel scan-panel">
+          <label for="sf-url">Target URL</label>
+          <div class="target-row"><input id="sf-url" type="text" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" required maxlength="2000" placeholder="https://community.example.com"><button id="sf-start" class="button primary" type="submit">Scan site</button></div>
+          <details class="advanced"><summary>Advanced options</summary>
+            <div class="options">
+              <label>Sample records <span class="unit">per object</span><input id="sf-sample-size" type="number" min="1" max="25" value="10" required></label>
+              <label>Object limit <span class="unit">objects</span><input id="sf-max-objects" type="number" min="1" max="200" value="50" required></label>
+            </div>
+            <p class="help">Read-only: the detector counts accessible objects and keeps a few sample records as evidence. It never dumps full datasets.</p>
+          </details>
+          <div class="form-foot">Guest-access check · Inspired by <a href="https://github.com/google/aura-inspector" target="_blank" rel="noopener noreferrer">AuraInspector</a></div>
+        </form>
+        <section class="results-section" aria-labelledby="sf-results-title">
+          <div class="section-top"><h2 id="sf-results-title">Detection results</h2><span id="sf-status" class="status" hidden></span></div>
+          <div class="scan-summary" id="sf-summary" hidden><div><p>Target: <strong id="sf-target" class="mono"></strong></p><p class="muted" id="sf-stats"></p></div><div class="scan-actions"><button class="button small" id="sf-rerun">Run again</button><button class="button small danger" id="sf-cancel" hidden>Cancel scan</button></div></div>
+          <p id="sf-verdict" class="notice" role="status" hidden></p>
+          <p id="sf-note" class="notice" role="status" hidden></p>
+          <div id="sf-tools" class="toolbar" hidden>
+            <div class="search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m16 16 4.5 4.5"></path></svg><input id="sf-filter" aria-label="Filter objects" placeholder="Filter objects…" autocomplete="off" spellcheck="false"></div>
+            <label class="sf-readable-toggle"><input id="sf-readable" type="checkbox">Readable only</label>
+            <select id="sf-export" class="button" aria-label="Export findings"><option value="">Export</option><option value="json">JSON (.json)</option><option value="csv">CSV (.csv)</option></select>
+          </div>
+          <div class="result-table" id="sf-table" hidden><table><thead><tr><th scope="col">Object</th><th scope="col">Records</th><th scope="col">Guest access</th><th scope="col">Sample evidence</th></tr></thead><tbody id="sf-rows"></tbody></table></div>
+          <div id="sf-empty" class="empty"><img src="/favicon.svg" alt="" width="44" height="44"><h3>Check a site for exposure.</h3><p>Enter a Salesforce community or site URL above to detect guest-readable data.</p></div>
+          <div id="sf-pagination" class="pagination" hidden><span class="muted" id="sf-page-label"></span><div><button class="button small" id="sf-previous">Previous</button><button class="button small" id="sf-next">Next</button></div></div>
         </section>
       </section>
       <section id="history-view" hidden>

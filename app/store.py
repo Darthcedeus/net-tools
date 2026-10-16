@@ -23,6 +23,21 @@ class Store:
                     host TEXT NOT NULL, sources TEXT NOT NULL,
                     PRIMARY KEY (scan_id, host)
                 );
+                CREATE TABLE IF NOT EXISTS sf_scans (
+                    id TEXT PRIMARY KEY, url TEXT NOT NULL, status TEXT NOT NULL,
+                    created REAL NOT NULL, started REAL, finished REAL,
+                    options TEXT NOT NULL, error TEXT,
+                    verdict TEXT, is_salesforce INTEGER NOT NULL DEFAULT 0,
+                    aura_endpoint TEXT, details TEXT NOT NULL DEFAULT '{}',
+                    count INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS sf_findings (
+                    scan_id TEXT NOT NULL REFERENCES sf_scans(id) ON DELETE CASCADE,
+                    object TEXT NOT NULL, key_prefix TEXT,
+                    readable INTEGER NOT NULL DEFAULT 0, record_count INTEGER,
+                    samples TEXT NOT NULL DEFAULT '[]',
+                    PRIMARY KEY (scan_id, object)
+                );
             ''')
             columns = {r['name'] for r in db.execute('PRAGMA table_info(results)')}
             if 'ips' not in columns:
@@ -30,8 +45,11 @@ class Store:
             if 'dns_status' not in columns:
                 db.execute("ALTER TABLE results ADD COLUMN dns_status TEXT NOT NULL DEFAULT 'not_checked'")
             db.execute("UPDATE results SET dns_status='not_checked' WHERE dns_status='pending'")
+            interrupted = 'The application restarted before this scan finished. Run it again.'
             db.execute("UPDATE scans SET status='interrupted', finished=?, error=? WHERE status IN ('queued', 'running')",
-                       (time.time(), 'The application restarted before this scan finished. Run it again.'))
+                       (time.time(), interrupted))
+            db.execute("UPDATE sf_scans SET status='interrupted', finished=?, error=? WHERE status IN ('queued', 'running')",
+                       (time.time(), interrupted))
 
     @contextmanager
     def connect(self):
@@ -111,3 +129,93 @@ class Store:
     def delete(self, scan_id):
         with self.connect() as db:
             db.execute('DELETE FROM scans WHERE id=?', (scan_id,))
+
+    # -- Salesforce detector -------------------------------------------------
+
+    @staticmethod
+    def decode_sf(row):
+        if row is None:
+            return None
+        scan = dict(row)
+        scan['options'] = json.loads(scan['options'])
+        scan['details'] = json.loads(scan['details'])
+        scan['is_salesforce'] = bool(scan['is_salesforce'])
+        scan['tool'] = 'salesforce'
+        return scan
+
+    def sf_get(self, scan_id):
+        with self.connect() as db:
+            return self.decode_sf(db.execute('SELECT * FROM sf_scans WHERE id=?', (scan_id,)).fetchone())
+
+    def sf_history(self):
+        with self.connect() as db:
+            return [self.decode_sf(r) for r in db.execute('SELECT * FROM sf_scans ORDER BY created DESC')]
+
+    def sf_create(self, scan_id, url, options):
+        with self.connect() as db:
+            db.execute('INSERT INTO sf_scans (id,url,status,created,options) VALUES (?,?,?,?,?)',
+                       (scan_id, url, 'queued', time.time(), json.dumps(options)))
+            db.execute("DELETE FROM sf_scans WHERE id IN (SELECT id FROM sf_scans WHERE status NOT IN ('queued','running') ORDER BY created DESC LIMIT -1 OFFSET 100)")
+
+    def sf_update(self, scan_id, **values):
+        allowed = {'status', 'started', 'finished', 'error'}
+        assert set(values) <= allowed
+        with self.connect() as db:
+            db.execute(f"UPDATE sf_scans SET {','.join(k + '=?' for k in values)} WHERE id=?", (*values.values(), scan_id))
+            if values.get('status') not in (None, 'queued', 'running'):
+                db.execute("DELETE FROM sf_scans WHERE id IN (SELECT id FROM sf_scans WHERE status NOT IN ('queued','running') ORDER BY created DESC LIMIT -1 OFFSET 100)")
+
+    def sf_set_summary(self, scan_id, summary):
+        with self.connect() as db:
+            db.execute('UPDATE sf_scans SET verdict=?,is_salesforce=?,aura_endpoint=?,details=? WHERE id=?',
+                       (summary.get('verdict'), 1 if summary.get('is_salesforce') else 0,
+                        summary.get('aura_endpoint'), json.dumps(summary), scan_id))
+
+    def sf_add_finding(self, scan_id, finding):
+        with self.connect() as db:
+            existing = db.execute('SELECT object FROM sf_findings WHERE scan_id=? AND object=?',
+                                  (scan_id, finding['object'])).fetchone()
+            db.execute('INSERT OR REPLACE INTO sf_findings (scan_id,object,key_prefix,readable,record_count,samples) '
+                       'VALUES (?,?,?,?,?,?)',
+                       (scan_id, finding['object'], finding.get('key_prefix'),
+                        1 if finding.get('readable') else 0, finding.get('record_count'),
+                        json.dumps(finding.get('samples', []))))
+            if finding.get('readable'):
+                db.execute('UPDATE sf_scans SET count=(SELECT count(*) FROM sf_findings WHERE scan_id=? AND readable=1) WHERE id=?',
+                           (scan_id, scan_id))
+            return existing is None
+
+    def sf_findings(self, scan_id, query='', readable_only=False, offset=0, limit=200):
+        query = query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+        with self.connect() as db:
+            where = "scan_id=? AND object LIKE ? ESCAPE '\\'" + (' AND readable=1' if readable_only else '')
+            params = (scan_id, '%' + query + '%')
+            total = db.execute('SELECT count(*) FROM sf_findings WHERE ' + where, params).fetchone()[0]
+            rows = db.execute('SELECT object,key_prefix,readable,record_count,samples FROM sf_findings WHERE '
+                              + where + ' ORDER BY readable DESC, object LIMIT ? OFFSET ?',
+                              (*params, limit, offset))
+            return {'total': total, 'items': [{'object': r['object'], 'key_prefix': r['key_prefix'],
+                                               'readable': bool(r['readable']), 'record_count': r['record_count'],
+                                               'samples': json.loads(r['samples'])} for r in rows]}
+
+    def sf_delete(self, scan_id):
+        with self.connect() as db:
+            db.execute('DELETE FROM sf_scans WHERE id=?', (scan_id,))
+
+    # -- shared activity across tools ---------------------------------------
+
+    def activity(self):
+        """Merge both tools' scans into a common shape for the shared feed."""
+        items = []
+        with self.connect() as db:
+            for r in db.execute('SELECT id,domain,status,created,started,finished,count FROM scans'):
+                items.append({'id': r['id'], 'tool': 'subdomains', 'label': r['domain'],
+                              'status': r['status'], 'created': r['created'], 'started': r['started'],
+                              'finished': r['finished'], 'count': r['count'], 'verdict': None})
+            for r in db.execute('SELECT id,url,status,created,started,finished,count,verdict,is_salesforce FROM sf_scans'):
+                items.append({'id': r['id'], 'tool': 'salesforce', 'label': r['url'],
+                              'status': r['status'], 'created': r['created'], 'started': r['started'],
+                              'finished': r['finished'], 'count': r['count'],
+                              'verdict': r['verdict'] if r['is_salesforce'] else 'not_salesforce'})
+        items.sort(key=lambda item: item['created'], reverse=True)
+        return items

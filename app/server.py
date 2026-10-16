@@ -19,7 +19,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from app.runner import Runner
+from app.salesforce import safe_target
 from app.security import normalize_domain, proxy_token, verify_password
+from app.sf_runner import SalesforceRunner
 from app.store import Store
 
 STATIC = Path(__file__).parent / 'static'
@@ -50,6 +52,7 @@ class Application:
         if provider and not Path(provider).is_file():
             raise ValueError('SUBFINDER_PROVIDER_CONFIG must point to a readable file.')
         self.runner = Runner(self.store, os.environ.get('SUBFINDER_BIN', 'subfinder'), provider)
+        self.sf_runner = SalesforceRunner(self.store)
 
     def session(self, token):
         with self.lock:
@@ -266,11 +269,77 @@ class Handler(BaseHTTPRequestHandler):
                         raise APIError(409, 'Cancel the scan and wait for it to stop before deleting it.')
                     self.app.store.delete(scan_id)
                     return self.send(200, {'ok': True})
+            if path == '/api/activity' and method == 'GET':
+                return self.send(200, self.app.store.activity())
+            if path == '/api/sf-scans':
+                if method == 'GET':
+                    return self.send(200, self.app.store.sf_history())
+                if method == 'POST':
+                    data = self.body()
+                    try:
+                        url = safe_target(data.get('url'))
+                    except ValueError as error:
+                        raise APIError(400, str(error)) from None
+                    opts = {}
+                    for key, default, low, high in [('sample_size', 10, 1, 25), ('max_objects', 50, 1, 200)]:
+                        value = data.get(key, default)
+                        if type(value) is not int or not low <= value <= high:
+                            raise APIError(400, f'{key} must be between {low} and {high}.')
+                        opts[key] = value
+                    return self.send(201, self.app.sf_runner.submit(url, opts))
+            match = re.fullmatch(r'/api/sf-scans/([a-f0-9]{32})(?:/(findings|export|cancel))?', path)
+            if match:
+                scan_id, action = match.groups()
+                scan = self.app.store.sf_get(scan_id)
+                if not scan:
+                    raise APIError(404, 'Scan not found.')
+                if method == 'GET' and not action:
+                    return self.send(200, scan)
+                if method == 'GET' and action == 'findings':
+                    try:
+                        offset = int(query.get('offset', ['0'])[0])
+                        if not 0 <= offset <= 10000:
+                            raise ValueError()
+                    except ValueError:
+                        raise APIError(400, 'Invalid result offset.') from None
+                    readable_only = query.get('readable', ['0'])[0] == '1'
+                    return self.send(200, self.app.store.sf_findings(scan_id, query.get('q', [''])[0][:128], readable_only, offset))
+                if method == 'GET' and action == 'export':
+                    fmt = query.get('format', ['json'])[0]
+                    rows = self.app.store.sf_findings(scan_id, query.get('q', [''])[0][:128], limit=10000)['items']
+                    if fmt == 'json':
+                        body, mime = json.dumps({'scan': scan, 'findings': rows}, indent=2), 'application/json'
+                    elif fmt == 'csv':
+                        output = io.StringIO()
+                        writer = csv.writer(output)
+                        writer.writerow(['object', 'key_prefix', 'readable', 'record_count', 'sample_count'])
+                        for row in rows:
+                            name = row['object']
+                            if name.startswith(('=', '+', '-', '@', '\t', '\r')):
+                                name = "'" + name
+                            writer.writerow([name, row['key_prefix'] or '', 'yes' if row['readable'] else 'no',
+                                             '' if row['record_count'] is None else row['record_count'], len(row['samples'])])
+                        body, mime = output.getvalue(), 'text/csv; charset=utf-8'
+                    else:
+                        raise APIError(400, 'Choose json or csv.')
+                    host = urlsplit(scan['url']).hostname or 'target'
+                    return self.send(200, body, mime, {'Content-Disposition': f'attachment; filename="{host}-{scan_id[:8]}.{fmt}"'})
+                if method == 'POST' and action == 'cancel':
+                    self.body()
+                    self.app.sf_runner.cancel(scan_id)
+                    return self.send(200, {'ok': True})
+                if method == 'DELETE' and not action:
+                    if self.headers.get('Content-Length') or self.headers.get('Transfer-Encoding'):
+                        self.body()
+                    if scan['status'] in ('queued', 'running'):
+                        raise APIError(409, 'Cancel the scan and wait for it to stop before deleting it.')
+                    self.app.store.sf_delete(scan_id)
+                    return self.send(200, {'ok': True})
             raise APIError(404, 'Endpoint not found.')
         # Explicit routes support direct visits and browser refreshes without
         # treating unknown tools, assets, or API paths as the application shell.
-        pages = {'/', '/tools/subdomains', '/activity'}
-        if method == 'GET' and path.rstrip('/') in {'/tools/subdomains', '/activity'}:
+        pages = {'/', '/tools/subdomains', '/tools/salesforce', '/activity'}
+        if method == 'GET' and path.rstrip('/') in {'/tools/subdomains', '/tools/salesforce', '/activity'}:
             path = path.rstrip('/')
         if method == 'GET' and path in pages | {'/app.js', '/tools.js', '/style.css', '/favicon.svg'}:
             file = STATIC / ('index.html' if path in pages else path[1:])
@@ -412,6 +481,7 @@ def main():
         server.serve_forever(poll_interval=0.3)
     finally:
         app.runner.close()
+        app.sf_runner.close()
         server.server_close()
 
 
