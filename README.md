@@ -4,6 +4,12 @@ A private, dark-themed, mobile-friendly suite for network discovery and diagnost
 
 The home page shows the tool directory and recent activity. Open Subdomain Finder to watch passive discovery results arrive with their IPv4 and IPv6 addresses, search them, and copy or download TXT, CSV, or JSON. Saved activity survives container recreation, and scans continue when your browser closes. You can cancel scans, restore options for another run, and delete old results. The interface works on phones without horizontal scrolling.
 
+After a Subdomain Finder scan finishes, select hosts with the result-row checkboxes and choose **Scan selected**, or use **Scan all matching** to scan the current filter across all result pages. Each Salesforce batch snapshots up to 100 saved hosts; larger selections must be narrowed first, and nothing is silently dropped. Set the sample size and object limit per host before starting. This follow-up performs active HTTP guest-access checks, using the same domain discovery and public-address guards as a standalone Salesforce scan.
+
+The batch runs one host at a time on the server and continues when the browser closes. Its results panel shows progress, Salesforce/leaking counts, errors and cancellations, with an **Open** link to each host's full findings. Cancel stops the current host and all remaining hosts without erasing completed results. Saved batches can be reopened from the source discovery or Activity, and their summary can be exported as JSON. Only one Salesforce batch can be active at a time. A failed host does not stop the other hosts. On restart, pending batch hosts resume; a host interrupted mid-scan is recorded as interrupted instead of being silently retried.
+
+The latest ten finished batches and their individual Salesforce results are retained, in addition to the latest 100 standalone Salesforce scans. A retained batch protects its source discovery from automatic history cleanup. Deleting a finished batch removes its host results; deleting a source discovery also removes its Salesforce batches. Active batches and their source discoveries must be cancelled and stopped before deletion.
+
 **Salesforce Detector** checks whether a site runs the Salesforce Aura/Lightning framework (Experience Cloud) and whether its guest user leaks data. Enter one target URL; the detector fingerprints the site, probes the unauthenticated Aura endpoint, and enumerates which standard and custom objects are readable by an anonymous guest, recording each object's total record count and a small sample of records (5–10 by default) as evidence. It is read-only — it counts and samples, never dumping full datasets — and classifies each target as *Not Salesforce*, *Salesforce* (guest access locked down), or *Leaking*. Only scan sites you own or are authorized to test. The checks combine the approach of Mandiant's [AuraInspector](https://github.com/google/aura-inspector) with related guest-access research. A built-in guard rejects private, loopback, link-local, and reserved addresses, so an internet-exposed instance cannot be aimed at internal services.
 
 You can enter just a domain, such as `example.com`. The detector tries known Aura routes, reads relevant HTML links and literal bootstrap URLs, inspects up to three same-host scripts, and uses `robots.txt` and XML sitemaps (including sitemap indexes) to find community paths. Common community paths provide a fallback when no links are available. Explicitly linked subdomains and Salesforce-hosted communities under `*.my.site.com`, `*.force.com`, or `*.salesforce-sites.com` can be checked; unrelated external hosts are excluded. Canonical redirects such as `example.com` to `www.example.com` are followed within that scope, with public-address validation on every hop.
@@ -181,6 +187,14 @@ Open `http://localhost:8080` exactly (rather than `127.0.0.1`), so origin checks
 ```sh
 python3 -m unittest discover -s tests -v
 ```
+
+With Node.js available, a dependency-free DOM simulation checks the Salesforce batch controls, request scope, progress, cancellation, and result navigation against the actual frontend module:
+
+```sh
+node tests/frontend_batch_smoke.cjs
+```
+
+This checks JavaScript behavior; it does not replace rendered desktop/mobile browser QA.
 
 The app is a single-process, single-user utility. Run one replica per data volume. It has no account management, shared-user separation, distributed queue, or built-in DNS validation. The Docker Compose setup is the supported deployment.
 

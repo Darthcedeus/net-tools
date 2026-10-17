@@ -510,6 +510,24 @@ td:first-child {
   border-color:#693846;
   background:#2b1920;
 }
+
+.batch-panel { margin-top:24px; padding:22px; }
+.batch-panel h3 { margin:0 0 10px; }
+.batch-panel select { margin-top:8px; width:100%; max-width:100%; }
+.batch-options { grid-template-columns:repeat(2,minmax(0,1fr)); padding-top:14px; }
+.batch-actions { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin:18px 0 10px; }
+.host-selection { display:flex; align-items:flex-start; gap:10px; margin:0; font:inherit; cursor:pointer; }
+.host-selection input { width:18px; height:18px; min-height:18px; flex:0 0 18px; margin:2px 0 0; padding:0; accent-color:var(--accent); }
+.host-selection span { min-width:0; overflow-wrap:anywhere; }
+.batch-table { margin-top:18px; }
+.batch-table th:nth-child(2) { width:auto; }
+.batch-table td { overflow-wrap:anywhere; }
+.batch-table .help { max-width:360px; overflow-wrap:anywhere; }
+@media(max-width:640px) {
+  .batch-panel { padding:16px; }
+  .batch-options { grid-template-columns:1fr; }
+  .batch-actions>.button { flex:1 1 100%; justify-content:center; }
+}
 .error {
   color:#ffa6a6;
   font-size:13px;
@@ -1101,3 +1119,4 @@ td>details>summary {
   color:var(--text);
   overflow-wrap:anywhere;
 }
+
