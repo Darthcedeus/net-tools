@@ -758,6 +758,29 @@ class SalesforceAPITests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(self.request('POST', '/api/sf-scans', body)[0], 400)
 
+    def test_domain_only_scan_discovers_linked_salesforce_community(self):
+        self.login()
+        endpoint = 'https://tenant.my.site.com/s/aura'
+        base = sf_fetch(landing=LANDING, object_data={'Account': (1, [{'Id': '001'}])})
+
+        def fetch(method, url, **kwargs):
+            if method == 'GET' and url == 'https://community.example.com':
+                return FetchResult(200, {}, b'<a href="https://tenant.my.site.com/s/">Support</a>', url)
+            if (method == 'POST' and url == endpoint) or (method == 'GET' and url.startswith('https://tenant.my.site.com/')):
+                return base(method, url, **kwargs)
+            return FetchResult(404, {}, b'<html>Not found</html>', url)
+
+        self.app.sf_runner.detector = Detector(fetch=fetch)
+        status, scan, _ = self.request('POST', '/api/sf-scans', {'url': 'community.example.com', 'max_objects': 1})
+        self.assertEqual(status, 201)
+        scan = self.wait_sf(scan['id'], lambda value: value['status'] == 'completed')
+        self.assertEqual(scan['url'], 'https://community.example.com')
+        self.assertEqual(scan['aura_endpoint'], endpoint)
+        self.assertEqual(scan['verdict'], 'leaking')
+        exported = self.request('GET', '/api/sf-scans/' + scan['id'] + '/export?format=json')[1]['scan']
+        self.assertEqual(exported['details']['discovery']['source'], 'HTML link')
+        self.assertEqual(exported['details']['discovery']['hosts_checked'], 2)
+
     def test_scan_lifecycle_findings_export_and_activity(self):
         self.login()
         status, scan, _ = self.request('POST', '/api/sf-scans', {'url': 'https://community.example.com/partners/s/', 'sample_size': 10, 'max_objects': 50})
