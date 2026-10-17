@@ -521,11 +521,11 @@ from app.salesforce import Detector, FetchResult, safe_target
 from app.sf_runner import SalesforceRunner
 
 
-def aura(actions, context_fwuid=None):
+def aura(actions, context_fwuid=None, url='https://x/aura'):
     """Build a fake Aura response for the given list of (descriptor-hint, payload)."""
-    body = {'actions': [{'id': str(i), 'descriptor': descriptor, **payload}
+    body = {'actions': [{'id': '1;a' if 'getConfigData' in descriptor else '2;a', **payload}
                         for i, (descriptor, payload) in enumerate(actions)]}
-    return FetchResult(200, {}, json.dumps(body).encode(), 'https://x/aura')
+    return FetchResult(200, {}, json.dumps(body).encode(), url)
 
 
 def sf_fetch(landing='', object_data=None, locked=False, require_fwuid=None, aura_live=True):
@@ -553,14 +553,14 @@ def sf_fetch(landing='', object_data=None, locked=False, require_fwuid=None, aur
             return FetchResult(200, {}, body, url)
         if 'getConfigData' in descriptor:
             return aura([(descriptor, {'state': 'SUCCESS', 'returnValue': {
-                'apiNamesToKeyPrefixes': {'Account': '001', 'Secret__c': 'a01'}}})])
+                'apiNamesToKeyPrefixes': {'Account': '001', 'Secret__c': 'a01'}}})], url=url)
         if 'getItems' in descriptor:
             name = params0.get('entityNameOrId')
             if locked or name not in object_data:
-                return aura([(descriptor, {'state': 'ERROR', 'error': [{'message': 'denied'}]})])
+                return aura([(descriptor, {'state': 'ERROR', 'error': [{'message': 'denied'}]})], url=url)
             total, records = object_data[name]
             return aura([(descriptor, {'state': 'SUCCESS', 'returnValue': {
-                'totalCount': total, 'result': records}})])
+                'totalCount': total, 'result': records}})], url=url)
         return FetchResult(500, {}, b'{}', url)
     return fetch
 
@@ -581,7 +581,7 @@ class SalesforceSafeTargetTests(unittest.TestCase):
 
     def test_normalizes_public_host(self):
         with patch('app.salesforce._addresses_are_public'):
-            self.assertEqual(safe_target('community.example.com/path?q=1'), 'https://community.example.com')
+            self.assertEqual(safe_target('community.example.com/path?q=1'), 'https://community.example.com/path?q=1')
             self.assertEqual(safe_target('http://example.org:8080'), 'http://example.org:8080')
 
 
@@ -760,9 +760,10 @@ class SalesforceAPITests(unittest.TestCase):
 
     def test_scan_lifecycle_findings_export_and_activity(self):
         self.login()
-        status, scan, _ = self.request('POST', '/api/sf-scans', {'url': 'https://community.example.com', 'sample_size': 10, 'max_objects': 50})
+        status, scan, _ = self.request('POST', '/api/sf-scans', {'url': 'https://community.example.com/partners/s/', 'sample_size': 10, 'max_objects': 50})
         self.assertEqual(status, 201)
         self.assertEqual(scan['tool'], 'salesforce')
+        self.assertEqual(scan['url'], 'https://community.example.com/partners/s/')
         self.wait_sf(scan['id'], lambda s: s['status'] == 'completed')
         scan = self.request('GET', '/api/sf-scans/' + scan['id'])[1]
         self.assertEqual(scan['verdict'], 'leaking')
@@ -788,3 +789,4 @@ class SalesforceAPITests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
