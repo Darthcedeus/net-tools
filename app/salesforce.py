@@ -21,9 +21,11 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
+from app.sf_discovery import DomainDiscovery
+
 # Paths that commonly expose the Aura message endpoint, relative to the site
 # root or to a discovered application prefix such as /partners or /support.
-AURA_PATHS = ('/s/sfsites/aura', '/s/aura', '/aura', '/sfsites/aura')
+AURA_PATHS = ('/s/sfsites/aura', '/s/aura', '/aura', '/sfsites/aura', '/s/fact')
 
 # Strings that identify a Salesforce Aura/Lightning (Experience Cloud) site in
 # the landing page markup or inline bootstrap script.
@@ -129,8 +131,12 @@ def safe_target(url):
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ''))
 
 
-def guarded_fetch(method, url, headers=None, data=None, timeout=10, max_bytes=MAX_BYTES):
-    """Fetch a URL, re-validating the host and refusing cross-host redirects.
+def guarded_fetch(method, url, headers=None, data=None, timeout=10, max_bytes=MAX_BYTES,
+                  redirect_policy=None):
+    """Fetch a URL, re-validating the host on every redirect hop.
+
+    Cross-host redirects are refused by default. Domain discovery supplies a
+    bounded scope policy for linked community hosts and canonical redirects.
 
     The host is re-resolved on every hop and rejected if it points at a private
     or reserved address, so DNS rebinding between requests cannot redirect the
@@ -155,7 +161,9 @@ def guarded_fetch(method, url, headers=None, data=None, timeout=10, max_bytes=MA
             if not location:
                 raise ValueError('The target returned an invalid redirect.') from None
             following = urlsplit(urljoin(current, location))
-            if (following.hostname or '').lower() != (parsed.hostname or '').lower():
+            if redirect_policy and not redirect_policy(urlunsplit(following)):
+                raise ValueError('Refusing to follow an out-of-scope redirect.') from None
+            if not redirect_policy and (following.hostname or '').lower() != (parsed.hostname or '').lower():
                 raise ValueError('Refusing to follow a redirect to another host.') from None
             current = urlunsplit(following)
             # Aura deployments can canonicalize POST endpoints with 301/302.
@@ -203,21 +211,36 @@ class Detector:
         {"meta", "finding"}. Returns a summary dict with the final verdict.
         """
         target = safe_target(target)
-        parsed = urlsplit(target)
-        origin = urlunsplit((parsed.scheme, parsed.netloc, '', '', ''))
         summary = {'is_salesforce': False, 'aura_endpoint': None, 'verdict': 'not_salesforce',
                    'app': None, 'fwuid': None, 'self_registration': False,
                    'objects_checked': 0, 'objects_readable': 0}
 
-        landing = self._fingerprint(target, cancel)
-        summary.update(landing)
-        emit('meta', dict(summary))
-        if cancel():
-            return summary
+        def discovery_fetch(method, url, **kwargs):
+            if self.fetch is guarded_fetch:
+                kwargs['redirect_policy'] = discovery.allow_redirect
+            return self.fetch(method, url, **kwargs)
 
-        endpoint, context = self._locate_endpoint(origin, landing, cancel)
+        discovery = DomainDiscovery(target, discovery_fetch, cancel, (DetectorError, ValueError))
+        endpoint, context, landing = None, {}, {}
+        tried = set()
+        emit('meta', dict(summary))
+        for page_url, response in discovery.pages():
+            landing = self._page_info(page_url, response)
+            summary.update(landing)
+            summary['discovery'] = {**discovery.details(), 'endpoints_checked': len(tried)}
+            emit('meta', dict(summary))
+            parsed = urlsplit(response.url if response is not None else page_url)
+            origin = urlunsplit((parsed.scheme, parsed.netloc, '', '', ''))
+            endpoint, context = self._locate_endpoint(origin, landing, discovery.stopped,
+                                                       fetch=discovery.request, tried=tried)
+            if endpoint or discovery.stopped():
+                break
+        summary['discovery'] = {**discovery.details(), 'endpoints_checked': len(tried)}
         if not endpoint:
+            emit('meta', dict(summary))
             return summary
+        summary['discovery']['selected_url'] = page_url
+        summary['discovery']['source'] = discovery.sources.get(page_url, 'discovered page')
         summary['is_salesforce'] = True
         summary['aura_endpoint'] = endpoint
         summary['app'] = context.get('app')
@@ -247,15 +270,20 @@ class Detector:
 
     # -- fingerprint --------------------------------------------------------
 
-    def _fingerprint(self, target, cancel):
+    def _fingerprint(self, target, cancel, fetch=None):
+        result = None
+        if not cancel():
+            try:
+                result = (fetch or self.fetch)('GET', target, timeout=self.request_timeout)
+            except DetectorError:
+                pass
+        return self._page_info(target, result)
+
+    def _page_info(self, target, result):
         info = {'app': None, 'fwuid': None, 'app_id': None, 'self_registration': False,
                 'app_prefixes': [], 'custom_objects': []}
         self._extract_path(target, info)
-        if cancel():
-            return info
-        try:
-            result = self.fetch('GET', target, timeout=self.request_timeout)
-        except DetectorError:
+        if result is None:
             return info
         self._extract_path(result.url, info)
         body = result.text()
@@ -302,17 +330,21 @@ class Detector:
 
     # -- Aura endpoint ------------------------------------------------------
 
-    def _locate_endpoint(self, origin, landing, cancel):
+    def _locate_endpoint(self, origin, landing, cancel, fetch=None, tried=None):
         app = landing.get('app') or DEFAULT_APP
         fwuid = landing.get('fwuid')
         context = self._context(app, fwuid, landing.get('app_id'))
-        prefixes = landing.get('app_prefixes', []) + ['']
+        prefixes = landing.get('app_prefixes', [])[:8] + ['']
+        tried = tried if tried is not None else set()
         for prefix in prefixes:
             for path in AURA_PATHS:
                 if cancel():
                     return None, context
                 endpoint = origin + prefix + path
-                probe = self._call(endpoint, context, [self._config_action()], cancel)
+                if endpoint in tried:
+                    continue
+                tried.add(endpoint)
+                probe = self._call(endpoint, context, [self._config_action()], cancel, fetch=fetch)
                 if probe is None:
                     continue
                 text = probe.text()
@@ -325,7 +357,7 @@ class Detector:
                 # Read the app associated with the confirmed endpoint before
                 # sending object requests, following AuraInspector's approach.
                 if not landing.get('app') or not landing.get('fwuid'):
-                    bootstrap = self._fingerprint(self._app_url(probe.url), cancel)
+                    bootstrap = self._fingerprint(self._app_url(probe.url), cancel, fetch=fetch)
                     context = self._context(bootstrap.get('app') or app,
                                             refreshed or bootstrap.get('fwuid') or context['fwuid'],
                                             bootstrap.get('app_id') or landing.get('app_id'))
@@ -448,7 +480,7 @@ class Detector:
                            'getCount': True, 'enableRowActions': False,
                            'useTimeout': False}}
 
-    def _call(self, endpoint, context, actions, cancel):
+    def _call(self, endpoint, context, actions, cancel, fetch=None):
         if cancel():
             return None
         payload = urlencode({'message': json.dumps({'actions': actions}),
@@ -459,8 +491,8 @@ class Detector:
                    'X-SFDC-Aura-Mode': 'PROD', 'Accept': 'application/json',
                    'User-Agent': 'NetTools-SalesforceDetector/1.0'}
         try:
-            return self.fetch('POST', endpoint, headers=headers, data=payload,
-                              timeout=self.request_timeout)
+            return (fetch or self.fetch)('POST', endpoint, headers=headers, data=payload,
+                                        timeout=self.request_timeout, max_bytes=MAX_BYTES)
         except DetectorError:
             return None
 
