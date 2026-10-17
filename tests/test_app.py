@@ -736,8 +736,17 @@ class SalesforceAPITests(unittest.TestCase):
         raise AssertionError(f'SF scan did not reach expected state: {self.app.store.sf_get(scan_id)}')
 
     def test_auth_csrf_and_url_validation(self):
-        self.assertEqual(self.request('GET', '/api/sf-scans')[0], 401)
-        self.assertEqual(self.request('GET', '/api/activity')[0], 401)
+        # Every Salesforce data endpoint sits behind the login gate; none can be
+        # reached without a session, including reads of findings and exports.
+        fake = 'f' * 32
+        for method, path in [('GET', '/api/sf-scans'), ('GET', '/api/activity'),
+                             ('POST', '/api/sf-scans'), ('GET', f'/api/sf-scans/{fake}'),
+                             ('GET', f'/api/sf-scans/{fake}/findings'),
+                             ('GET', f'/api/sf-scans/{fake}/export?format=csv'),
+                             ('POST', f'/api/sf-scans/{fake}/cancel'),
+                             ('DELETE', f'/api/sf-scans/{fake}')]:
+            with self.subTest(path=path):
+                self.assertEqual(self.request(method, path)[0], 401)
         self.login()
         # CSRF and origin are enforced on mutation.
         self.assertEqual(self.request('POST', '/api/sf-scans', {'url': 'community.example.com'}, {'X-CSRF-Token': ''})[0], 403)
