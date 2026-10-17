@@ -77,6 +77,23 @@
           <div class="result-table" id="result-table" hidden><table><thead><tr><th scope="col">Subdomain</th><th scope="col">IP addresses</th><th scope="col">Sources</th></tr></thead><tbody id="result-rows"></tbody></table></div>
           <div id="empty" class="empty"><img src="/favicon.svg" alt="" width="44" height="44"><h3>A clearer picture starts here.</h3><p>Enter a domain above to discover its subdomains.</p></div>
           <div id="pagination" class="pagination" hidden><span class="muted" id="page-label"></span><div><button class="button small" id="previous">Previous</button><button class="button small" id="next">Next</button></div></div>
+          <section id="sf-bulk" class="panel batch-panel" aria-labelledby="sf-bulk-title" hidden>
+            <h3 id="sf-bulk-title">Check these hosts for Salesforce</h3>
+            <p class="help" id="sf-bulk-help">Select hosts in the table, or scan all matching results across pages. Up to 100 hosts per batch.</p>
+            <div class="options batch-options">
+              <label>Sample records <span class="unit">per object</span><input id="batch-sample-size" type="number" min="1" max="25" value="10" required></label>
+              <label>Object limit <span class="unit">per host</span><input id="batch-max-objects" type="number" min="1" max="200" value="50" required></label>
+            </div>
+            <div class="batch-actions"><button id="sf-scan-selected" class="button">Scan selected (0)</button><button id="sf-scan-matching" class="button primary">Scan all matching (0)</button><button id="sf-clear-selection" class="button small">Clear selection</button></div>
+            <p class="help" id="sf-bulk-scope"></p>
+          </section>
+          <section id="sf-batch-panel" class="panel batch-panel" aria-labelledby="sf-batch-title" hidden>
+            <div class="section-top"><h3 id="sf-batch-title">Salesforce batch results</h3><span id="sf-batch-status" class="status"></span></div>
+            <label for="sf-batch-history">Saved batches for this discovery</label><select id="sf-batch-history"></select>
+            <p id="sf-batch-progress" role="status"></p><p id="sf-batch-note" class="help"></p>
+            <div class="batch-actions"><button id="sf-batch-cancel" class="button small danger">Cancel remaining scans</button><a id="sf-batch-export" class="button small" download>Export batch JSON</a></div>
+            <div class="result-table batch-table"><table><thead><tr><th scope="col">Host</th><th scope="col">Status</th><th scope="col">Outcome</th><th scope="col">Result</th></tr></thead><tbody id="sf-batch-rows"></tbody></table></div>
+          </section>
         </section>
       </section>
       <section id="salesforce-view" hidden>
@@ -120,3 +137,4 @@
   <div id="toast" class="toast" role="status" hidden></div>
 </body>
 </html>
+

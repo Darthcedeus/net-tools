@@ -42,16 +42,47 @@ class SalesforceRunner:
 
     def cancel(self, scan_id):
         with self.lock:
+            scan = self.store.sf_get(scan_id)
+            if not scan or scan['status'] not in ('queued', 'running'):
+                return False
             event = self.cancellations.get(scan_id)
             if event:
                 event.set()
-                scan = self.store.sf_get(scan_id)
-                if scan and scan['status'] == 'queued':
-                    self.store.sf_update(scan_id, status='cancelled', finished=time.time())
-            return event is not None
+            if scan['status'] == 'queued':
+                self.store.sf_update(scan_id, status='cancelled', finished=time.time())
+            return True
+
+    def submit_batch(self, source_id, options, hosts=None, query=''):
+        with self.lock:
+            if self.stopping.is_set():
+                raise ValueError('The application is shutting down.')
+            return self.store.sf_batch_create(uuid.uuid4().hex, source_id, options, hosts, query)
+
+    def cancel_batch(self, batch_id):
+        with self.lock:
+            batch = self.store.sf_batch_get(batch_id)
+            if not batch or batch['status'] not in ('queued', 'running'):
+                return
+            self.store.sf_batch_cancel(batch_id)
+            for scan in batch['items']:
+                event = self.cancellations.get(scan['id'])
+                if event:
+                    event.set()
+
+    def fill_queue(self):
+        # Keep only a few jobs in memory. Pending batch hosts live in SQLite,
+        # so queue capacity never truncates a batch and queued hosts can resume.
+        with self.lock:
+            for scan_id in self.store.sf_pending():
+                if self.jobs.full() or self.stopping.is_set():
+                    break
+                if scan_id not in self.cancellations:
+                    self.cancellations[scan_id] = threading.Event()
+                    self.jobs.put_nowait(scan_id)
 
     def work(self):
         while not self.stopping.is_set():
+            self.fill_queue()
             try:
                 scan_id = self.jobs.get(timeout=0.5)
             except queue.Empty:
@@ -68,14 +99,19 @@ class SalesforceRunner:
                 self.jobs.task_done()
 
     def run(self, scan_id):
-        scan = self.store.sf_get(scan_id)
-        event = self.cancellations[scan_id]
-        if event.is_set():
-            self.store.sf_update(scan_id, status='cancelled', finished=time.time())
-            return
-        options = scan['options']
-        deadline = time.monotonic() + min(options.get('max_time', 2) * 60, self.max_scan_seconds)
-        self.store.sf_update(scan_id, status='running', started=time.time())
+        # Claim a queued host under the cancellation lock, so a batch cannot
+        # appear fully cancelled while this worker is still starting a host.
+        with self.lock:
+            scan = self.store.sf_get(scan_id)
+            event = self.cancellations[scan_id]
+            if scan is None or scan['status'] != 'queued':
+                return
+            if event.is_set():
+                self.store.sf_update(scan_id, status='cancelled', finished=time.time())
+                return
+            options = scan['options']
+            deadline = time.monotonic() + min(options.get('max_time', 2) * 60, self.max_scan_seconds)
+            self.store.sf_update(scan_id, status='running', started=time.time())
 
         def cancelled():
             return event.is_set() or self.stopping.is_set() or time.monotonic() >= deadline
@@ -110,3 +146,4 @@ class SalesforceRunner:
             for event in self.cancellations.values():
                 event.set()
         self.worker.join(timeout=10)
+

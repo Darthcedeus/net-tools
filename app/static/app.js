@@ -5,6 +5,7 @@ const $ = (id) => document.getElementById(id);
 const state = {
   csrf: null, authenticated: false, generation: 0, engine: false, busy: false, tab: 'home',
   selected: null, offset: 0, total: 0, query: '',
+  selectedHosts: new Set(), sfBatch: null, sfBatches: [], batchBusy: false,
   sfSelected: null, sfOffset: 0, sfTotal: 0, sfQuery: '', sfReadable: false,
   activity: [],
 };
@@ -83,7 +84,7 @@ async function resumeWorkspace() {
   } else if (state.tab === 'discovery') {
     const scan = id ? await api(`/api/scans/${id}`).catch(() => null) : state.selected;
     if (!guard(generation, route)) return;
-    if (scan) { state.selected = scan; state.generation++; paintScan(); await refreshResults(); }
+    if (scan) { if (state.selected?.id !== scan.id) { state.selectedHosts.clear(); state.sfBatch = null; state.sfBatches = []; } state.selected = scan; state.generation++; paintScan(); await refreshResults(); }
   }
 }
 function guard(generation, route) {
@@ -104,15 +105,18 @@ function elapsed(scan) {
 function paintScan() {
   const scan = state.selected;
   $('scan-summary').hidden = !scan; $('scan-status').hidden = !scan; $('result-tools').hidden = !scan;
-  if (!scan) { $('result-table').hidden = true; $('pagination').hidden = true; $('empty').hidden = false; return; }
+  $('sf-bulk').hidden = !scan;
+  if (!scan) { $('result-table').hidden = true; $('pagination').hidden = true; $('empty').hidden = false; $('sf-batch-panel').hidden = true; return; }
   $('scan-status').className = 'status ' + scan.status; $('scan-status').textContent = statuses[scan.status] || scan.status;
   $('scan-domain').textContent = scan.domain;
   $('scan-stats').textContent = `${scan.count.toLocaleString()} subdomain${scan.count === 1 ? '' : 's'} · ${elapsed(scan)}`;
   $('cancel').hidden = !active(scan); $('rerun').hidden = active(scan);
   message('scan-note', scan.error || (scan.status === 'queued' ? 'Your scan is queued and will start when the current scan finishes.' : scan.status === 'running' ? 'Discovery and IP lookups are running. You can leave this page; results will be saved on your server.' : ''));
+  paintBatchActions();
 }
 async function selectScan(scan) {
   state.generation++; state.selected = scan; state.offset = 0; state.query = ''; $('filter').value = '';
+  state.selectedHosts.clear(); state.sfBatch = null; state.sfBatches = []; $('sf-batch-panel').hidden = true;
   $('cancel').disabled = false; $('cancel').textContent = 'Cancel scan';
   setTab('discovery', { scanId: scan.id, load: false }); paintScan(); await refreshResults();
 }
@@ -127,7 +131,15 @@ async function refreshResults() {
   const fragment = document.createDocumentFragment();
   for (const item of results.items) {
     const row = document.createElement('tr'), host = document.createElement('td'), sources = document.createElement('td'), list = document.createElement('div');
-    host.textContent = item.host; list.className = 'source-list';
+    const choice = document.createElement('label'), checkbox = document.createElement('input'), hostname = document.createElement('span');
+    choice.className = 'host-selection'; checkbox.type = 'checkbox'; checkbox.checked = state.selectedHosts.has(item.host);
+    checkbox.setAttribute('aria-label', `Select ${item.host}`); checkbox.disabled = active(scan);
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked && state.selectedHosts.size >= 100) { checkbox.checked = false; toast('Select up to 100 hosts per batch.'); return; }
+      if (checkbox.checked) state.selectedHosts.add(item.host); else state.selectedHosts.delete(item.host);
+      paintBatchActions();
+    });
+    hostname.textContent = item.host; choice.append(checkbox, hostname); host.append(choice); list.className = 'source-list';
     const addresses = document.createElement('td'); addresses.className = 'ip-cell'; addresses.dataset.label = 'IP addresses';
     for (const ip of item.ips || []) {
       const value = document.createElement('div'); value.className = 'ip-address';
@@ -151,6 +163,82 @@ async function refreshResults() {
   $('pagination').hidden = !results.total;
   $('page-label').textContent = `${(offset + 1).toLocaleString()}–${(offset + results.items.length).toLocaleString()} of ${results.total.toLocaleString()}${query ? ' matching' : ''} subdomains`;
   $('previous').disabled = offset === 0; $('next').disabled = offset + 200 >= results.total;
+  await refreshBatches();
+}
+
+/* ---- Salesforce batches from discovery results -------------------------- */
+
+function paintBatchActions() {
+  const blocked = active(state.selected) || state.batchBusy || state.sfBatches.some(active);
+  $('sf-scan-selected').textContent = `Scan selected (${state.selectedHosts.size})`;
+  $('sf-scan-matching').textContent = `Scan all matching (${state.total.toLocaleString()})`;
+  $('sf-scan-selected').disabled = blocked || !state.selectedHosts.size;
+  $('sf-scan-matching').disabled = blocked || !state.total || state.total > 100;
+  $('sf-clear-selection').disabled = !state.selectedHosts.size || state.batchBusy;
+  $('sf-bulk-scope').textContent = active(state.selected) ? 'Wait for discovery to finish. The batch uses a snapshot of saved results.' :
+    state.sfBatches.some(active) ? 'A Salesforce batch is running. Progress is saved even if you close this page.' :
+    state.total > 100 ? `${state.total.toLocaleString()} matching hosts. Narrow the filter or select up to 100 hosts to scan.` :
+    `${state.total.toLocaleString()} matching hosts across all pages${state.query ? ` for “${state.query}”` : ''}. Only hosts saved by this discovery can be scanned.`;
+}
+
+async function refreshBatches(preferredId = null) {
+  if (!state.selected || !state.authenticated) return;
+  const sourceId = state.selected.id, generation = state.generation;
+  const batches = await api(`/api/scans/${sourceId}/sf-batches`);
+  if (generation !== state.generation || sourceId !== state.selected?.id) return;
+  state.sfBatches = batches;
+  const id = preferredId || (batches.some(b => b.id === state.sfBatch?.id) ? state.sfBatch.id : batches[0]?.id);
+  const batch = id ? await api(`/api/sf-batches/${id}`) : null;
+  if (generation !== state.generation || sourceId !== state.selected?.id) return;
+  state.sfBatch = batch; paintBatchActions(); paintBatch();
+}
+
+function paintBatch() {
+  const batch = state.sfBatch;
+  $('sf-batch-panel').hidden = !batch;
+  if (!batch) return;
+  const options = document.createDocumentFragment();
+  for (const saved of state.sfBatches) {
+    const option = document.createElement('option'); option.value = saved.id;
+    option.textContent = `${formatDate(saved.created, true)} · ${saved.done}/${saved.total} hosts · ${statuses[saved.status] || saved.status}`;
+    options.append(option);
+  }
+  $('sf-batch-history').replaceChildren(options); $('sf-batch-history').value = batch.id;
+  $('sf-batch-status').className = 'status ' + batch.status; $('sf-batch-status').textContent = statuses[batch.status] || batch.status;
+  $('sf-batch-progress').textContent = `${batch.done} of ${batch.total} hosts finished · ${batch.salesforce} Salesforce · ${batch.leaking} leaking`;
+  const errors = batch.failed + batch.timed_out + batch.interrupted;
+  $('sf-batch-note').textContent = `${batch.query ? `Filter: “${batch.query}”. ` : ''}${errors} failed, timed out or interrupted · ${batch.cancelled} cancelled. Each host has its own result; failed scans do not stop the batch.`;
+  $('sf-batch-cancel').hidden = !active(batch); $('sf-batch-cancel').disabled = batch.cancel_requested;
+  $('sf-batch-cancel').textContent = batch.cancel_requested ? 'Cancelling…' : 'Cancel remaining scans';
+  $('sf-batch-export').href = `/api/sf-batches/${batch.id}/export`;
+  const rows = document.createDocumentFragment();
+  for (const scan of batch.items) {
+    const row = document.createElement('tr'), host = document.createElement('td'), status = document.createElement('td'), outcome = document.createElement('td'), action = document.createElement('td');
+    host.textContent = sfTargetHost(scan.url); status.dataset.label = 'Status'; status.append(statusElement(scan));
+    outcome.dataset.label = 'Outcome'; outcome.textContent = scan.error || (scan.verdict ? `${verdicts[scan.verdict]} · ${scan.count} readable objects` : 'Waiting for a result');
+    if (scan.aura_endpoint) { const endpoint = document.createElement('div'); endpoint.className = 'help mono'; endpoint.textContent = scan.aura_endpoint; outcome.append(endpoint); }
+    const link = document.createElement('a'); link.href = `/tools/salesforce?scan=${scan.id}`; link.className = 'button small'; link.textContent = 'Open'; link.setAttribute('aria-label', `Open Salesforce result for ${sfTargetHost(scan.url)}`);
+    link.addEventListener('click', async event => { event.preventDefault(); try { await selectSfScan(await api(`/api/sf-scans/${scan.id}`)); } catch (error) { reportError(error); } });
+    action.append(link); row.append(host, status, outcome, action); rows.append(row);
+  }
+  $('sf-batch-rows').replaceChildren(rows);
+}
+
+async function startBatch(selected) {
+  if (!state.selected || state.batchBusy) return;
+  if (!$('batch-sample-size').reportValidity() || !$('batch-max-objects').reportValidity()) return;
+  const sourceId = state.selected.id, generation = state.generation;
+  const data = { sample_size: Number($('batch-sample-size').value), max_objects: Number($('batch-max-objects').value),
+    ...(selected ? { hosts: [...state.selectedHosts] } : { q: state.query }) };
+  state.batchBusy = true; paintBatchActions(); message('app-error', '');
+  try {
+    const batch = await api(`/api/scans/${sourceId}/sf-batches`, { method: 'POST', body: JSON.stringify(data) });
+    if (generation === state.generation && sourceId === state.selected?.id) {
+      await refreshBatches(batch.id); state.selectedHosts.clear(); await refreshResults();
+      $('sf-batch-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+    await refreshActivity(); toast(`Salesforce batch queued for ${batch.total} hosts.`);
+  } catch (error) { reportError(error); } finally { state.batchBusy = false; paintBatchActions(); }
 }
 
 /* ---- Salesforce Detector ------------------------------------------------ */
@@ -236,6 +324,7 @@ async function refreshSfResults() {
 /* ---- Shared activity ---------------------------------------------------- */
 
 function activityMeta(item) {
+  if (item.batch_id) return 'Salesforce batch';
   if (item.tool === 'salesforce') {
     const verdict = item.verdict && verdicts[item.verdict] ? verdicts[item.verdict] : '';
     return `${toolName(item.tool)}${verdict ? ' · ' + verdict : ''}`;
@@ -243,6 +332,7 @@ function activityMeta(item) {
   return `${toolName(item.tool)}`;
 }
 function activityCount(item) {
+  if (item.batch_id) return `${item.count}/${item.total} hosts finished · ${item.leaking} leaking`;
   if (item.tool === 'salesforce') return `${item.count.toLocaleString()} readable object${item.count === 1 ? '' : 's'}`;
   return `${item.count.toLocaleString()} subdomain${item.count === 1 ? '' : 's'}`;
 }
@@ -255,16 +345,18 @@ function activityBadge(item) {
 }
 async function openActivity(item) {
   try {
-    if (item.tool === 'salesforce') { const scan = await api(`/api/sf-scans/${item.id}`); await selectSfScan(scan); }
+    if (item.batch_id) { await selectScan(await api(`/api/scans/${item.source_scan_id}`)); await refreshBatches(item.batch_id); $('sf-batch-panel').scrollIntoView({ block: 'start' }); }
+    else if (item.tool === 'salesforce') { const scan = await api(`/api/sf-scans/${item.id}`); await selectSfScan(scan); }
     else { const scan = await api(`/api/scans/${item.id}`); await selectScan(scan); }
   } catch (error) { reportError(error); }
 }
 async function deleteActivity(item) {
   const noun = item.tool === 'salesforce' ? 'scan' : 'scan';
-  if (!confirm(`Delete this ${toolName(item.tool)} ${noun} for ${item.label} and its results?`)) return;
-  const endpoint = item.tool === 'salesforce' ? `/api/sf-scans/${item.id}` : `/api/scans/${item.id}`;
+  if (!confirm(`Delete this ${item.batch_id ? 'Salesforce batch' : toolName(item.tool) + ' ' + noun} for ${item.label} and its results${item.tool === 'subdomains' ? ', including its Salesforce batches' : ''}?`)) return;
+  const endpoint = item.batch_id ? `/api/sf-batches/${item.id}` : item.tool === 'salesforce' ? `/api/sf-scans/${item.id}` : `/api/scans/${item.id}`;
   try {
     await api(endpoint, { method: 'DELETE' });
+    if (item.batch_id && state.selected) { state.sfBatch = null; await refreshBatches(); }
     if (item.tool === 'salesforce' && state.sfSelected?.id === item.id) { state.sfSelected = null; state.generation++; paintSfScan(); message('sf-note', ''); }
     if (item.tool === 'subdomains' && state.selected?.id === item.id) { state.selected = null; state.generation++; paintScan(); message('scan-note', ''); }
     await refreshActivity(); toast('Scan deleted.');
@@ -343,7 +435,17 @@ $('rerun').addEventListener('click', () => {
   $('domain').value = scan.domain; $('max-time').value = scan.options.max_time; $('timeout').value = scan.options.timeout; $('rate-limit').value = scan.options.rate_limit; $('all-sources').checked = scan.options.all_sources; $('recursive').checked = scan.options.recursive;
   $('domain').focus(); $('scan-form').scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth', block: 'center' }); toast('Scan options restored. Press Start discovery to run again.');
 });
-$('filter').addEventListener('input', () => { state.query = $('filter').value.trim(); state.offset = 0; clearTimeout(filterTimer); filterTimer = setTimeout(() => refreshResults().catch(reportError), 200); });
+$('filter').addEventListener('input', () => { state.query = $('filter').value.trim(); state.offset = 0; state.selectedHosts.clear(); paintBatchActions(); clearTimeout(filterTimer); filterTimer = setTimeout(() => refreshResults().catch(reportError), 200); });
+$('sf-scan-selected').addEventListener('click', () => startBatch(true));
+$('sf-scan-matching').addEventListener('click', () => startBatch(false));
+$('sf-clear-selection').addEventListener('click', () => { state.selectedHosts.clear(); refreshResults().catch(reportError); });
+$('sf-batch-history').addEventListener('change', () => refreshBatches($('sf-batch-history').value).catch(reportError));
+$('sf-batch-cancel').addEventListener('click', async () => {
+  if (!state.sfBatch) return;
+  $('sf-batch-cancel').disabled = true;
+  try { await api(`/api/sf-batches/${state.sfBatch.id}/cancel`, { method: 'POST', body: '{}' }); await refreshBatches(); }
+  catch (error) { $('sf-batch-cancel').disabled = false; reportError(error); }
+});
 $('previous').addEventListener('click', () => { state.offset = Math.max(0, state.offset - 200); refreshResults().catch(reportError); });
 $('next').addEventListener('click', () => { state.offset += 200; refreshResults().catch(reportError); });
 $('copy').addEventListener('click', async () => {
@@ -400,7 +502,7 @@ async function poll() {
   if (state.busy || !state.authenticated || document.hidden) return;
   state.busy = true;
   try {
-    if (state.tab === 'discovery' && active(state.selected)) await refreshResults();
+    if (state.tab === 'discovery' && state.selected) { if (active(state.selected)) await refreshResults(); else await refreshBatches(); }
     if (state.tab === 'salesforce' && active(state.sfSelected)) await refreshSfResults();
     if (['home', 'history'].includes(state.tab) || state.activity.some(active)) await refreshActivity();
   } catch (error) { reportError(error); } finally { state.busy = false; }
@@ -413,3 +515,4 @@ setInterval(poll, 2000);
     state.csrf = session.csrf; state.engine = session.engine_available; showWorkspace(); await resumeWorkspace();
   } catch (error) { if (!state.authenticated) { showLogin(); message('login-error', 'Could not reach the server. Refresh to reconnect.'); } else reportError(error); }
 })();
+

@@ -22,7 +22,7 @@ from app.runner import Runner
 from app.salesforce import safe_target
 from app.security import normalize_domain, proxy_token, verify_password
 from app.sf_runner import SalesforceRunner
-from app.store import Store
+from app.store import Store, MAX_SF_BATCH_HOSTS
 
 STATIC = Path(__file__).parent / 'static'
 
@@ -116,14 +116,14 @@ class Handler(BaseHTTPRequestHandler):
             # The deadline can close the socket before even an error is sent.
             self.close_connection = True
 
-    def body(self):
+    def body(self, max_bytes=4096):
         if self.headers.get('Transfer-Encoding'):
             raise APIError(400, 'Chunked request bodies are not supported.')
         if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
             raise APIError(415, 'Use a JSON request body.')
         try:
             length = int(self.headers.get('Content-Length', '0'))
-            if not 0 < length <= 4096:
+            if not 0 < length <= max_bytes:
                 raise APIError(413, 'Request body is too large or missing.')
             data = json.loads(self.rfile.read(length))
             if not isinstance(data, dict):
@@ -131,6 +131,16 @@ class Handler(BaseHTTPRequestHandler):
             return data
         except (ValueError, UnicodeError):
             raise APIError(400, 'Invalid JSON request.') from None
+
+    @staticmethod
+    def sf_options(data):
+        options = {}
+        for key, default, low, high in [('sample_size', 10, 1, 25), ('max_objects', 50, 1, 200)]:
+            value = data.get(key, default)
+            if type(value) is not int or not low <= value <= high:
+                raise APIError(400, f'{key} must be between {low} and {high}.')
+            options[key] = value
+        return options
 
     def cookie(self, value, age):
         return f'sf_session={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={age}' + ('; Secure' if self.app.secure else '')
@@ -221,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
                             raise APIError(400, f'{key} must be true or false.')
                         opts[key] = value
                     return self.send(201, self.app.runner.submit(domain, opts))
-            match = re.fullmatch(r'/api/scans/([a-f0-9]{32})(?:/(results|export|cancel))?', path)
+            match = re.fullmatch(r'/api/scans/([a-f0-9]{32})(?:/(results|export|cancel|sf-batches))?', path)
             if match:
                 scan_id, action = match.groups()
                 scan = self.app.store.get(scan_id)
@@ -229,6 +239,22 @@ class Handler(BaseHTTPRequestHandler):
                     raise APIError(404, 'Scan not found.')
                 if method == 'GET' and not action:
                     return self.send(200, scan)
+                if action == 'sf-batches':
+                    if method == 'GET':
+                        return self.send(200, self.app.store.sf_batches(scan_id))
+                    if method == 'POST':
+                        data = self.body(max_bytes=32768)
+                        if scan['status'] in ('queued', 'running'):
+                            raise APIError(409, 'Wait for subdomain discovery to finish before scanning its results.')
+                        hosts = data.get('hosts')
+                        if hosts is not None:
+                            if not isinstance(hosts, list) or not 1 <= len(hosts) <= MAX_SF_BATCH_HOSTS:
+                                raise APIError(400, f'Select between 1 and {MAX_SF_BATCH_HOSTS} hosts.')
+                            hosts = sorted({normalize_domain(host) for host in hosts})
+                        filter_query = data.get('q', '')
+                        if not isinstance(filter_query, str) or len(filter_query) > 253 or (hosts is not None and filter_query):
+                            raise APIError(400, 'Choose selected hosts or a subdomain filter, not both.')
+                        return self.send(201, self.app.sf_runner.submit_batch(scan_id, self.sf_options(data), hosts, filter_query))
                 if method == 'GET' and action == 'results':
                     try:
                         offset = int(query.get('offset', ['0'])[0])
@@ -267,6 +293,8 @@ class Handler(BaseHTTPRequestHandler):
                         self.body()
                     if scan['status'] in ('queued', 'running'):
                         raise APIError(409, 'Cancel the scan and wait for it to stop before deleting it.')
+                    if any(batch['status'] in ('queued', 'running') for batch in self.app.store.sf_batches(scan_id)):
+                        raise APIError(409, 'Cancel the Salesforce batch and wait for it to stop before deleting this discovery.')
                     self.app.store.delete(scan_id)
                     return self.send(200, {'ok': True})
             if path == '/api/activity' and method == 'GET':
@@ -280,13 +308,27 @@ class Handler(BaseHTTPRequestHandler):
                         url = safe_target(data.get('url'))
                     except ValueError as error:
                         raise APIError(400, str(error)) from None
-                    opts = {}
-                    for key, default, low, high in [('sample_size', 10, 1, 25), ('max_objects', 50, 1, 200)]:
-                        value = data.get(key, default)
-                        if type(value) is not int or not low <= value <= high:
-                            raise APIError(400, f'{key} must be between {low} and {high}.')
-                        opts[key] = value
-                    return self.send(201, self.app.sf_runner.submit(url, opts))
+                    return self.send(201, self.app.sf_runner.submit(url, self.sf_options(data)))
+            match = re.fullmatch(r'/api/sf-batches/([a-f0-9]{32})(?:/(cancel|export))?', path)
+            if match:
+                batch_id, action = match.groups()
+                batch = self.app.store.sf_batch_get(batch_id)
+                if not batch:
+                    raise APIError(404, 'Salesforce batch not found.')
+                if method == 'GET' and not action:
+                    return self.send(200, batch)
+                if method == 'GET' and action == 'export':
+                    return self.send(200, json.dumps(batch, indent=2), 'application/json',
+                                     {'Content-Disposition': f'attachment; filename="{batch["source_domain"]}-salesforce-{batch_id[:8]}.json"'})
+                if method == 'POST' and action == 'cancel':
+                    self.body()
+                    self.app.sf_runner.cancel_batch(batch_id)
+                    return self.send(200, {'ok': True})
+                if method == 'DELETE' and not action:
+                    if batch['status'] in ('queued', 'running'):
+                        raise APIError(409, 'Cancel the batch and wait for it to stop before deleting it.')
+                    self.app.store.sf_batch_delete(batch_id)
+                    return self.send(200, {'ok': True})
             match = re.fullmatch(r'/api/sf-scans/([a-f0-9]{32})(?:/(findings|export|cancel))?', path)
             if match:
                 scan_id, action = match.groups()
@@ -333,6 +375,8 @@ class Handler(BaseHTTPRequestHandler):
                         self.body()
                     if scan['status'] in ('queued', 'running'):
                         raise APIError(409, 'Cancel the scan and wait for it to stop before deleting it.')
+                    if scan['batch_id']:
+                        raise APIError(409, 'Delete the Salesforce batch to remove this result.')
                     self.app.store.sf_delete(scan_id)
                     return self.send(200, {'ok': True})
             raise APIError(404, 'Endpoint not found.')
@@ -487,3 +531,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

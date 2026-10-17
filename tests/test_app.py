@@ -242,7 +242,7 @@ class APITests(unittest.TestCase):
         self.thread.start(); self.cookie = ''; self.csrf = ''
 
     def tearDown(self):
-        self.server.shutdown(); self.app.runner.close(); self.server.server_close()
+        self.server.shutdown(); self.app.runner.close(); self.app.sf_runner.close(); self.server.server_close()
         self.environment.stop(); self.directory.cleanup()
         self.dns_patch.stop()
 
