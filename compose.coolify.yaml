@@ -1,0 +1,36 @@
+services:
+  subfinder:
+    build:
+      context: .
+      args:
+        SUBFINDER_VERSION: v2.17.0
+    restart: unless-stopped
+    init: true
+    environment:
+      APP_ORIGIN: ${APP_ORIGIN:?Run python3 scripts/setup.py first}
+      APP_PASSWORD_HASH: ${APP_PASSWORD_HASH:?Run python3 scripts/setup.py first}
+    ports:
+      - "0.0.0.0:8083:8080"
+    volumes:
+      - subfinder-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,uid=10001,gid=10001,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  subfinder-data:
+    external: true
+    name: net-tools_subfinder-data
