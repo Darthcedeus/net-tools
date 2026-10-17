@@ -4,10 +4,13 @@ A private, dark-themed, mobile-friendly suite for network discovery and diagnost
 
 The home page shows the tool directory and recent activity. Open Subdomain Finder to watch passive discovery results arrive with their IPv4 and IPv6 addresses, search them, and copy or download TXT, CSV, or JSON. Saved activity survives container recreation, and scans continue when your browser closes. You can cancel scans, restore options for another run, and delete old results. The interface works on phones without horizontal scrolling.
 
+**Salesforce Detector** checks whether a site runs the Salesforce Aura/Lightning framework (Experience Cloud) and whether its guest user leaks data. Enter one target URL; the detector fingerprints the site, probes the unauthenticated Aura endpoint, and enumerates which standard and custom objects are readable by an anonymous guest, recording each object's total record count and a small sample of records (5–10 by default) as evidence. It is read-only — it counts and samples, never dumping full datasets — and classifies each target as *Not Salesforce*, *Salesforce* (guest access locked down), or *Leaking*. Only scan sites you own or are authorized to test. The checks combine the approach of Mandiant's [AuraInspector](https://github.com/google/aura-inspector) with related guest-access research. A built-in guard rejects private, loopback, link-local, and reserved addresses, so an internet-exposed instance cannot be aimed at internal services.
+
 | Page | Route | Status |
 | --- | --- | --- |
 | Home / tool directory | `/` | Available |
 | Subdomain Finder | `/tools/subdomains` | Available |
+| Salesforce Detector | `/tools/salesforce` | Available |
 | Shared activity | `/activity` | Available |
 | DNS Lookup | — | Planned |
 | TLS Inspector | — | Planned |
