@@ -17,6 +17,7 @@ import ipaddress
 import json
 import re
 import socket
+import ssl
 import urllib.error
 import urllib.request
 from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
@@ -132,7 +133,7 @@ def safe_target(url):
 
 
 def guarded_fetch(method, url, headers=None, data=None, timeout=10, max_bytes=MAX_BYTES,
-                  redirect_policy=None):
+                  redirect_policy=None, ignore_tls_errors=False):
     """Fetch a URL, re-validating the host on every redirect hop.
 
     Cross-host redirects are refused by default. Domain discovery supplies a
@@ -152,7 +153,10 @@ def guarded_fetch(method, url, headers=None, data=None, timeout=10, max_bytes=MA
         request = urllib.request.Request(current, data=data, method=method,
                                          headers=headers or {})
         try:
-            opener = urllib.request.build_opener(_NoRedirect)
+            handlers = [_NoRedirect]
+            if ignore_tls_errors:
+                handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+            opener = urllib.request.build_opener(*handlers)
             with opener.open(request, timeout=timeout) as response:
                 body = response.read(max_bytes + 1)[:max_bytes]
                 return FetchResult(response.status, dict(response.headers), body, response.url)
@@ -177,7 +181,16 @@ def guarded_fetch(method, url, headers=None, data=None, timeout=10, max_bytes=MA
             body = error.read(max_bytes + 1)[:max_bytes] if error.fp else b''
             return FetchResult(error.code, dict(error.headers or {}), body, current)
         except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as error:
-            raise DetectorError(f'The target could not be reached: {type(error).__name__}.') from None
+            reason = getattr(error, 'reason', error)
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                message = 'TLS certificate verification failed.'
+            elif isinstance(reason, ssl.SSLError):
+                message = 'TLS connection failed.'
+            elif isinstance(reason, (socket.timeout, TimeoutError)):
+                message = 'The target connection timed out.'
+            else:
+                message = f'The target could not be reached: {type(reason).__name__}.'
+            raise DetectorError(message) from None
     raise ValueError('The target redirected too many times.')
 
 
@@ -195,11 +208,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class Detector:
     """Fingerprints a target and enumerates guest-readable Salesforce objects."""
 
-    def __init__(self, fetch=None, sample_size=10, max_objects=50, request_timeout=10):
+    def __init__(self, fetch=None, sample_size=10, max_objects=50, request_timeout=10, ignore_tls_errors=False):
         self.fetch = fetch or guarded_fetch
         self.sample_size = max(1, min(int(sample_size), 25))
         self.max_objects = max(1, min(int(max_objects), 200))
         self.request_timeout = request_timeout
+        self.ignore_tls_errors = ignore_tls_errors
+        self.connection_errors = []
 
     # -- public entry point -------------------------------------------------
 
@@ -210,14 +225,17 @@ class Detector:
         ``emit`` is called as ``emit(kind, payload)`` with kind in
         {"meta", "finding"}. Returns a summary dict with the final verdict.
         """
+        self.connection_errors = []
         target = safe_target(target)
         summary = {'is_salesforce': False, 'aura_endpoint': None, 'verdict': 'not_salesforce',
                    'app': None, 'fwuid': None, 'self_registration': False,
-                   'objects_checked': 0, 'objects_readable': 0}
+                   'objects_checked': 0, 'objects_readable': 0,
+                   'aura_confirmed': False, 'ignore_tls_errors': self.ignore_tls_errors}
 
         def discovery_fetch(method, url, **kwargs):
             if self.fetch is guarded_fetch:
                 kwargs['redirect_policy'] = discovery.allow_redirect
+                kwargs['ignore_tls_errors'] = self.ignore_tls_errors
             return self.fetch(method, url, **kwargs)
 
         discovery = DomainDiscovery(target, discovery_fetch, cancel, (DetectorError, ValueError))
@@ -226,7 +244,12 @@ class Detector:
         emit('meta', dict(summary))
         for page_url, response in discovery.pages():
             landing = self._page_info(page_url, response)
+            fingerprint = summary.get('fingerprint', False) or landing.get('fingerprint', False)
             summary.update(landing)
+            summary['fingerprint'] = fingerprint
+            if landing.get('fingerprint'):
+                summary['is_salesforce'] = True
+                summary['verdict'] = 'salesforce_detected'
             summary['discovery'] = {**discovery.details(), 'endpoints_checked': len(tried)}
             emit('meta', dict(summary))
             parsed = urlsplit(response.url if response is not None else page_url)
@@ -237,12 +260,15 @@ class Detector:
                 break
         summary['discovery'] = {**discovery.details(), 'endpoints_checked': len(tried)}
         if not endpoint:
+            if not summary['is_salesforce'] and (discovery.error_count or discovery.limited or cancel()):
+                summary['verdict'] = 'unable_to_verify'
             emit('meta', dict(summary))
             return summary
         summary['discovery']['selected_url'] = page_url
         summary['discovery']['source'] = discovery.sources.get(page_url, 'discovered page')
         summary['is_salesforce'] = True
         summary['aura_endpoint'] = endpoint
+        summary['aura_confirmed'] = True
         summary['app'] = context.get('app')
         summary['fwuid'] = context.get('fwuid')
         summary['verdict'] = 'salesforce'
@@ -261,6 +287,7 @@ class Detector:
             if finding['readable']:
                 readable += 1
             emit('finding', finding)
+        summary['connection_errors'] = list(self.connection_errors)
         summary['objects_checked'] = checked
         summary['objects_readable'] = readable
         if readable:
@@ -491,9 +518,16 @@ class Detector:
                    'X-SFDC-Aura-Mode': 'PROD', 'Accept': 'application/json',
                    'User-Agent': 'NetTools-SalesforceDetector/1.0'}
         try:
-            return (fetch or self.fetch)('POST', endpoint, headers=headers, data=payload,
+            request_fetch = fetch or self.fetch
+            tls_options = {'ignore_tls_errors': self.ignore_tls_errors} if request_fetch is guarded_fetch else {}
+            return request_fetch('POST', endpoint, headers=headers, data=payload, **tls_options,
                                         timeout=self.request_timeout, max_bytes=MAX_BYTES)
-        except DetectorError:
+        except DetectorError as error:
+            if len(self.connection_errors) < 10:
+                parsed = urlsplit(endpoint)
+                self.connection_errors.append({'method': 'POST',
+                    'url': urlunsplit((parsed.scheme, parsed.netloc, parsed.path, '', '')),
+                    'message': str(error)[:200]})
             return None
 
     def _action(self, text, needle):

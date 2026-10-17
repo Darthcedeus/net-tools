@@ -62,6 +62,8 @@ class DomainDiscovery:
         self.port = parsed.port
         self.origin = urlunsplit((parsed.scheme, parsed.netloc, '', '', ''))
         self.requests = 0
+        self.error_count = 0
+        self.errors_seen = []
         self.pages_checked = 0
         self.scripts_checked = 0
         self.limited = False
@@ -122,10 +124,22 @@ class DomainDiscovery:
         kwargs['timeout'] = min(kwargs.get('timeout', 3), 3, max(0.1, self.deadline - self.clock()))
         kwargs['max_bytes'] = min(kwargs.get('max_bytes', MAX_BYTES), 2_000_000)
         try:
-            return self.fetch(method, url, **kwargs)
-        except self.errors:
+            result = self.fetch(method, url, **kwargs)
+            if result is not None and (result.status in (401, 403, 429) or result.status >= 500):
+                self._record_error(method, url, f'HTTP {result.status}')
+            return result
+        except self.errors as error:
+            self._record_error(method, url, str(error))
             # An inaccessible optional candidate must not fail the target job.
             return None
+
+    def _record_error(self, method, url, message):
+        self.error_count += 1
+        if len(self.errors_seen) < 10:
+            parsed = urlsplit(url)
+            self.errors_seen.append({'method': method,
+                                     'url': urlunsplit((parsed.scheme, parsed.netloc, parsed.path, '', '')),
+                                     'message': message[:200]})
 
     def _enqueue(self, value, base, kind='page', priority=2, source='link', depth=0):
         value = html.unescape(value).replace('\\/', '/').replace('\\u002f', '/').replace('\\u002F', '/')
@@ -238,4 +252,5 @@ class DomainDiscovery:
 
     def details(self):
         return {'requests': self.requests, 'pages_checked': self.pages_checked,
-                'hosts_checked': len(self.hosts), 'limited': self.limited}
+                'hosts_checked': len(self.hosts), 'limited': self.limited,
+                'error_count': self.error_count, 'errors': list(self.errors_seen)}

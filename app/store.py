@@ -355,7 +355,7 @@ class Store:
                 items.append({'id': r['id'], 'tool': 'salesforce', 'label': r['url'],
                               'status': r['status'], 'created': r['created'], 'started': r['started'],
                               'finished': r['finished'], 'count': r['count'],
-                              'verdict': r['verdict'] if r['is_salesforce'] else 'not_salesforce'})
+                              'verdict': r['verdict']})
         for batch in self.sf_batches():
             items.append({'id': batch['id'], 'batch_id': batch['id'], 'source_scan_id': batch['source_scan_id'],
                           'tool': 'salesforce', 'label': batch['source_domain'], 'status': batch['status'],

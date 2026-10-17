@@ -7,7 +7,7 @@ const html = fs.readFileSync(root + '/app/static/index.html', 'utf8');
 const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]);
 assert.equal(ids.length, new Set(ids).size, 'duplicate HTML ids');
 class Element {
-  constructor(tag = 'div') { this.tag = tag; this.children = []; this.listeners = {}; this.value = ''; this.hidden = false; this.disabled = false; this.dataset = {}; this.classList = { toggle() {}, add() {}, remove() {} }; this.attrs = {}; }
+  constructor(tag = 'div') { this.checked = false; this.tag = tag; this.children = []; this.listeners = {}; this.value = ''; this.hidden = false; this.disabled = false; this.dataset = {}; this.classList = { toggle() {}, add() {}, remove() {} }; this.attrs = {}; }
   set textContent(value) { this.text = String(value); this.children = []; }
   get textContent() { return (this.text || '') + this.children.map(n => n.textContent || '').join(''); }
   append(...nodes) { for (const n of nodes) this.children.push(...(n.fragment ? n.children : [typeof n === 'string' ? { textContent: n } : n])); }
@@ -27,7 +27,7 @@ const doc = { hidden: false, title: '', body: new Element(), getElementById(id) 
 const sourceId = 'f'.repeat(32), location = { pathname: '/tools/subdomains', search: '?scan=' + sourceId };
 const source = { id: sourceId, domain: 'example.com', status: 'completed', count: 201, options: {}, created: 1, started: 1, finished: 2 };
 const hosts = [{ host: 'api.example.com', sources: ['fixture'], ips: [], dns_status: 'no_records' }, { host: 'support.example.com', sources: ['fixture'], ips: [], dns_status: 'no_records' }];
-const batches = [], sent = [];
+const batches = [], sent = [], standaloneSent = [];
 let activity = [], confirmDelete = true, deleteConflict = false;
 const deletionRequests = [], confirmations = [];
 const summary = b => { const { items, ...rest } = b; return rest; };
@@ -58,6 +58,7 @@ async function fetch(path, options = {}) {
     const id = path.split('/')[3]; value = batches.find(b => b.id === id); assert(value);
     if (path.endsWith('/cancel')) { value.status = 'cancelled'; value.cancel_requested = true; value.cancelled = 1; value.done = 1; value.items[0].status = 'cancelled'; }
   } else if (path.includes('/findings?')) value = { total: 0, items: [] };
+  else if (path === '/api/sf-scans' && options.method === 'POST') { standaloneSent.push(JSON.parse(options.body)); value = batches[0].items[0]; }
   else if (path.startsWith('/api/sf-scans/')) { value = batches.flatMap(b => b.items).find(s => s.id === path.split('/')[3]); assert(value); }
   else throw new Error('Unexpected API path ' + path);
   return { ok: true, json: async () => structuredClone(value) };
@@ -75,16 +76,30 @@ async function settle() { for (let i = 0; i < 30; i++) await new Promise(resolve
   assert.equal(elements['sf-scan-matching'].disabled, true, 'large all-matching batch must be disabled');
   const checkbox = elements['result-rows'].children[0].children[0].children[0].children[0];
   checkbox.checked = true; await checkbox.fire('change'); assert.equal(elements['sf-scan-selected'].disabled, false);
-  await elements['sf-scan-selected'].fire('click'); await settle(); assert.deepEqual(sent[0].hosts, ['api.example.com']);
+  await elements['sf-scan-selected'].fire('click'); await settle(); assert.deepEqual(sent[0].hosts, ['api.example.com']); assert.equal(sent[0].ignore_tls_errors, false);
   assert.match(elements['sf-batch-progress'].textContent, /1 of 1 hosts finished/); assert.equal(elements['sf-scan-selected'].disabled, true);
   elements.filter.value = 'support'; await elements.filter.fire('input');
   for (const [id, t] of [...timers]) if (t.delay === 200) { timers.delete(id); await t.cb(); }
   await settle(); assert.equal(elements['sf-scan-matching'].disabled, false);
-  await elements['sf-scan-matching'].fire('click'); await settle(); assert.equal(sent[1].q, 'support'); assert(!('hosts' in sent[1]));
+  elements['batch-ignore-tls'].checked = true;
+  await elements['sf-scan-matching'].fire('click'); await settle(); assert.equal(sent[1].q, 'support'); assert.equal(sent[1].ignore_tls_errors, true); assert(!('hosts' in sent[1]));
   assert.equal(elements['sf-scan-selected'].disabled, true, 'active batch blocks another launch');
   await elements['sf-batch-cancel'].fire('click'); await settle(); assert.equal(elements['sf-batch-cancel'].hidden, true);
   const open = elements['sf-batch-rows'].children[0].children[3].children[0]; await open.fire('click'); await settle();
   assert.equal(location.pathname, '/tools/salesforce'); assert.match(elements['sf-target'].textContent, /support.example.com/);
+  const inconclusive = batches[0].items[0];
+  inconclusive.status = 'completed'; inconclusive.verdict = 'unable_to_verify';
+  inconclusive.options = { sample_size: 10, max_objects: 50, ignore_tls_errors: true };
+  inconclusive.details = { discovery: { errors: [{ method: 'GET', url: inconclusive.url, message: 'TLS certificate verification failed.' }] } };
+  await open.fire('click'); await settle();
+  assert.match(elements['sf-verdict'].textContent, /Unable to verify/);
+  assert.match(elements['sf-verdict'].textContent, /verification was disabled/);
+  assert.equal(elements['sf-diagnostics'].hidden, false);
+  assert.match(elements['sf-diagnostic-list'].textContent, /TLS certificate verification failed/);
+  await elements['sf-rerun'].fire('click'); assert.equal(elements['sf-ignore-tls'].checked, true);
+  await elements['sf-form'].fire('submit'); await settle(); assert.equal(standaloneSent[0].ignore_tls_errors, true);
+  elements['sf-ignore-tls'].checked = false;
+  await elements['sf-form'].fire('submit'); await settle(); assert.equal(standaloneSent[1].ignore_tls_errors, false);
   const record = (id, tool, extra = {}) => ({ id: id.repeat(32), tool, label: `${id}.example.com`, created: 1, started: 1, finished: 2, status: 'completed', count: 0, verdict: null, delete_kind: tool, deletable: true, ...extra });
   activity = [record('a', 'subdomains'), record('b', 'salesforce'), record('c', 'salesforce', { batch_id: 'c'.repeat(32), source_scan_id: 'a'.repeat(32), delete_kind: 'salesforce_batch', total: 1, leaking: 0 }),
     record('d', 'salesforce', { status: 'running', deletable: false }), record('e', 'subdomains', { deletable: false }),
