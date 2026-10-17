@@ -125,7 +125,8 @@ class SalesforceRunner:
         detector = Detector(fetch=self.detector.fetch,
                             sample_size=options.get('sample_size', 10),
                             max_objects=options.get('max_objects', 50),
-                            request_timeout=options.get('request_timeout', 10))
+                            request_timeout=options.get('request_timeout', 10),
+                            ignore_tls_errors=options.get('ignore_tls_errors', False))
         status, error = 'completed', None
         try:
             detector.run(scan['url'], cancelled, emit)

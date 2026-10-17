@@ -140,6 +140,10 @@ class Handler(BaseHTTPRequestHandler):
             if type(value) is not int or not low <= value <= high:
                 raise APIError(400, f'{key} must be between {low} and {high}.')
             options[key] = value
+        ignore_tls = data.get('ignore_tls_errors', False)
+        if type(ignore_tls) is not bool:
+            raise APIError(400, 'ignore_tls_errors must be a boolean.')
+        options['ignore_tls_errors'] = ignore_tls
         return options
 
     def cookie(self, value, age):
