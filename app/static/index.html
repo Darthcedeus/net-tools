@@ -128,6 +128,13 @@
       <section id="history-view" hidden>
         <div class="intro"><h1 tabindex="-1">Your activity.</h1><p>Pick up where you left off. Results from your tools, in one place.</p></div>
         <div class="section-top history-heading"><h2>Activity history</h2><button id="refresh-history" class="button small">Refresh</button></div>
+        <div id="history-selection" class="history-selection" hidden>
+          <label class="history-select-all"><input id="history-select-all" type="checkbox">Select all</label>
+          <span id="history-selection-count" class="muted" role="status">0 selected</span>
+          <button id="history-clear-selection" class="button small">Clear selection</button>
+          <button id="history-delete-selected" class="button small danger" disabled>Delete selected (0)</button>
+          <p class="help">Active scans and discoveries with active Salesforce batches cannot be selected.</p>
+        </div>
         <div id="history-list" class="history-list"></div>
         <div id="history-empty" class="empty" hidden><img src="/favicon.svg" alt="" width="44" height="44"><h3>A fresh workspace.</h3><p>Your discoveries will appear here as you use your tools.</p><button id="first-scan" class="button primary">Open Subdomain Finder</button></div>
       </section>

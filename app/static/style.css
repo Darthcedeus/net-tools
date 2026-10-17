@@ -535,6 +535,11 @@ td:first-child {
 .history-heading {
   margin-bottom:18px;
 }
+.history-selection { display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin-bottom:16px; }
+.history-selection .help { flex:1 1 100%; margin:0; }
+.history-select-all { display:flex; align-items:center; gap:8px; margin:0; font-size:13px; }
+.activity-checkbox,.history-select-all input { width:18px; height:18px; min-height:18px; flex:0 0 18px; padding:0; margin:0; accent-color:var(--accent); }
+@media(max-width:640px) { .history-selection>.button { flex:1 1 auto; } }
 .history-list {
   display:flex;
   flex-direction:column;

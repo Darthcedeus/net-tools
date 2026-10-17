@@ -1,5 +1,6 @@
 """SQLite-backed scan history. Each thread opens its own connection."""
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -304,6 +305,44 @@ class Store:
 
     # -- shared activity across tools ---------------------------------------
 
+    def delete_activities(self, items):
+        """Validate the whole selection before deleting anything, including cascades."""
+        if not isinstance(items, list) or not 1 <= len(items) <= 500:
+            raise ValueError('Select between 1 and 500 activities.')
+        selection = set()
+        for item in items:
+            if (not isinstance(item, dict) or item.get('kind') not in ('subdomains', 'salesforce', 'salesforce_batch')
+                    or not isinstance(item.get('id'), str) or not re.fullmatch(r'[a-f0-9]{32}', item['id'])):
+                raise ValueError('Invalid activity selection.')
+            key = (item['kind'], item['id'])
+            if key in selection:
+                raise ValueError('Select each activity only once.')
+            selection.add(key)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            for kind, activity_id in selection:
+                if kind == 'salesforce_batch':
+                    row = db.execute('SELECT id FROM sf_batches WHERE id=?', (activity_id,)).fetchone()
+                    busy = db.execute("SELECT 1 FROM sf_scans WHERE batch_id=? AND status IN ('queued','running') LIMIT 1", (activity_id,)).fetchone()
+                elif kind == 'salesforce':
+                    row = db.execute('SELECT status,batch_id FROM sf_scans WHERE id=?', (activity_id,)).fetchone()
+                    if row is not None and row['batch_id'] is not None:
+                        raise ValueError('Select the Salesforce batch instead of an individual batch result.')
+                    busy = row is not None and row['status'] in ('queued', 'running')
+                else:
+                    row = db.execute('SELECT status FROM scans WHERE id=?', (activity_id,)).fetchone()
+                    busy = row is not None and row['status'] in ('queued', 'running')
+                    busy = busy or db.execute("SELECT 1 FROM sf_scans s JOIN sf_batches b ON s.batch_id=b.id WHERE b.source_scan_id=? AND s.status IN ('queued','running') LIMIT 1", (activity_id,)).fetchone()
+                if row is None:
+                    raise ValueError('Activity history changed. Refresh and select the activities again. Nothing was deleted.')
+                if busy:
+                    raise ValueError('Cancel active scans and Salesforce batches and wait for them to stop. Nothing was deleted.')
+            # Batch-first ordering also handles a selected discovery plus its
+            # selected batch. Source deletion still cascades any other batches.
+            for kind, table in (('salesforce_batch', 'sf_batches'), ('salesforce', 'sf_scans'), ('subdomains', 'scans')):
+                db.executemany(f'DELETE FROM {table} WHERE id=?', [(activity_id,) for selected_kind, activity_id in selection if selected_kind == kind])
+        return {'deleted': len(selection)}
+
     def activity(self):
         """Merge both tools' scans into a common shape for the shared feed."""
         items = []
@@ -322,6 +361,10 @@ class Store:
                           'tool': 'salesforce', 'label': batch['source_domain'], 'status': batch['status'],
                           'created': batch['created'], 'started': batch['started'], 'finished': batch['finished'],
                           'count': batch['done'], 'total': batch['total'], 'leaking': batch['leaking'], 'verdict': None})
+        protected_sources = {item['source_scan_id'] for item in items if item.get('batch_id') and item['status'] in ('queued', 'running')}
+        for item in items:
+            item['delete_kind'] = 'salesforce_batch' if item.get('batch_id') else item['tool']
+            item['deletable'] = item['status'] not in ('queued', 'running') and not (item['tool'] == 'subdomains' and item['id'] in protected_sources)
         items.sort(key=lambda item: item['created'], reverse=True)
         return items
 

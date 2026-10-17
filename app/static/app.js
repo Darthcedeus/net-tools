@@ -8,6 +8,7 @@ const state = {
   selectedHosts: new Set(), sfBatch: null, sfBatches: [], batchBusy: false,
   sfSelected: null, sfOffset: 0, sfTotal: 0, sfQuery: '', sfReadable: false,
   activity: [],
+  activitySelection: new Set(), activityDeleting: false, activityRequest: 0,
 };
 const ROUTES = { home: '/', discovery: SUBDOMAINS.path, salesforce: SALESFORCE.path, history: '/activity' };
 const PAGE_TITLES = { home: 'Home', discovery: SUBDOMAINS.name, salesforce: SALESFORCE.name, history: 'Activity' };
@@ -31,6 +32,7 @@ function message(id, text) { $(id).textContent = text || ''; $(id).hidden = !tex
 function toast(text) { message('toast', text); clearTimeout(toastTimer); toastTimer = setTimeout(() => { $('toast').hidden = true; }, 3500); }
 function showLogin() {
   state.authenticated = false; state.csrf = null; state.generation++;
+  state.activitySelection.clear(); state.activityRequest++;
   $('boot').hidden = true; $('workspace').hidden = true; $('navigation').hidden = true; $('logout').hidden = true; $('login-view').hidden = false;
   $('password').value = ''; $('password').focus();
   document.title = 'Net Tools · Sign in';
@@ -351,19 +353,48 @@ async function openActivity(item) {
   } catch (error) { reportError(error); }
 }
 async function deleteActivity(item) {
-  const noun = item.tool === 'salesforce' ? 'scan' : 'scan';
-  if (!confirm(`Delete this ${item.batch_id ? 'Salesforce batch' : toolName(item.tool) + ' ' + noun} for ${item.label} and its results${item.tool === 'subdomains' ? ', including its Salesforce batches' : ''}?`)) return;
-  const endpoint = item.batch_id ? `/api/sf-batches/${item.id}` : item.tool === 'salesforce' ? `/api/sf-scans/${item.id}` : `/api/scans/${item.id}`;
-  try {
-    await api(endpoint, { method: 'DELETE' });
-    if (item.batch_id && state.selected) { state.sfBatch = null; await refreshBatches(); }
-    if (item.tool === 'salesforce' && state.sfSelected?.id === item.id) { state.sfSelected = null; state.generation++; paintSfScan(); message('sf-note', ''); }
-    if (item.tool === 'subdomains' && state.selected?.id === item.id) { state.selected = null; state.generation++; paintScan(); message('scan-note', ''); }
-    await refreshActivity(); toast('Scan deleted.');
-  } catch (error) { reportError(error); }
+  return deleteActivities([item]);
 }
-async function refreshActivity() {
-  const items = await api('/api/activity'); if (!state.authenticated) return;
+function activityKey(item) { return `${item.delete_kind || (item.batch_id ? 'salesforce_batch' : item.tool)}:${item.id}`; }
+function canDeleteActivity(item) { return item.deletable !== false && !active(item); }
+function paintActivitySelection() {
+  const eligible = state.activity.filter(canDeleteActivity);
+  $('history-selection').hidden = !state.activity.length;
+  const count = state.activitySelection.size;
+  $('history-selection-count').textContent = `${count} selected`;
+  $('history-delete-selected').textContent = state.activityDeleting ? 'Deleting…' : `Delete selected (${count})`;
+  $('history-delete-selected').disabled = !count || state.activityDeleting;
+  $('history-clear-selection').disabled = !count || state.activityDeleting;
+  $('history-select-all').disabled = !eligible.length || state.activityDeleting;
+  $('history-select-all').checked = !!eligible.length && eligible.every(item => state.activitySelection.has(activityKey(item)));
+  $('history-select-all').indeterminate = count > 0 && !$('history-select-all').checked;
+}
+async function deleteActivities(items) {
+  if (state.activityDeleting || !items.length) return;
+  const labels = items.slice(0, 5).map(item => `${item.batch_id ? 'Salesforce batch' : toolName(item.tool)}: ${item.label}`).join('\n');
+  const extra = items.length > 5 ? `\n…and ${items.length - 5} more.` : '';
+  const cascades = items.some(item => item.tool === 'subdomains') ? '\nDeleting a discovery also deletes its Salesforce batches.' : '';
+  if (!confirm(`Permanently delete ${items.length} selected activit${items.length === 1 ? 'y' : 'ies'} and their saved results?\n\n${labels}${extra}${cascades}`)) return;
+  state.activityDeleting = true; state.activityRequest++; message('app-error', ''); paintActivitySelection(); renderActivityRows();
+  try {
+    await api('/api/activity/delete', { method: 'POST', body: JSON.stringify({ items: items.map(item => ({ kind: item.delete_kind || (item.batch_id ? 'salesforce_batch' : item.tool), id: item.id })) }) });
+    const sources = new Set(items.filter(item => item.tool === 'subdomains').map(item => item.id));
+    const batches = new Set([...items.filter(item => item.batch_id).map(item => item.id), ...state.activity.filter(item => item.batch_id && sources.has(item.source_scan_id)).map(item => item.id)]);
+    if (state.sfSelected && (items.some(item => !item.batch_id && item.tool === 'salesforce' && item.id === state.sfSelected.id) || batches.has(state.sfSelected.batch_id))) {
+      state.sfSelected = null; state.generation++; paintSfScan(); message('sf-note', '');
+    }
+    if (sources.has(state.selected?.id)) { state.selected = null; state.sfBatch = null; state.sfBatches = []; state.selectedHosts.clear(); state.generation++; paintScan(); message('scan-note', ''); }
+    else if (state.selected && batches.size) { state.sfBatch = null; await refreshBatches(); }
+    state.activitySelection.clear(); toast('Selected activities deleted.');
+  } catch (error) { reportError(error); }
+  finally { state.activityDeleting = false; await refreshActivity().catch(reportError); paintActivitySelection(); }
+}
+function renderActivityRows() {
+  const items = state.activity;
+  const focusedKey = document.activeElement?.dataset?.activityKey;
+  let focusAfterRefresh = null;
+  const eligibleKeys = new Set(items.filter(canDeleteActivity).map(activityKey));
+  for (const key of state.activitySelection) if (!eligibleKeys.has(key)) state.activitySelection.delete(key);
   state.activity = items;
   const list = document.createDocumentFragment();
   for (const item of items) {
@@ -371,11 +402,24 @@ async function refreshActivity() {
     row.className = 'history-row'; open.className = 'history-open'; label.className = 'history-domain mono'; meta.className = 'history-meta';
     label.textContent = item.label; meta.textContent = `${activityMeta(item)} · ${formatDate(item.created)} · ${activityCount(item)} · ${elapsed(item)}`;
     open.append(label, meta); open.addEventListener('click', () => openActivity(item));
-    remove.className = 'history-delete'; remove.textContent = '×'; remove.setAttribute('aria-label', `Delete ${item.label}`); remove.title = 'Delete scan'; remove.disabled = active(item);
+    const choice = document.createElement('input'); choice.type = 'checkbox'; choice.className = 'activity-checkbox';
+    choice.dataset.activityKey = activityKey(item);
+    if (focusedKey === choice.dataset.activityKey) focusAfterRefresh = choice;
+    choice.setAttribute('aria-label', `Select ${item.label} (${activityMeta(item)})`); choice.checked = state.activitySelection.has(activityKey(item)); choice.disabled = state.activityDeleting || !canDeleteActivity(item);
+    choice.addEventListener('change', () => { if (choice.checked) state.activitySelection.add(activityKey(item)); else state.activitySelection.delete(activityKey(item)); paintActivitySelection(); });
+    remove.className = 'history-delete'; remove.textContent = '×'; remove.setAttribute('aria-label', `Delete ${item.label}`); remove.title = 'Delete scan'; remove.disabled = state.activityDeleting || !canDeleteActivity(item);
     remove.addEventListener('click', () => deleteActivity(item));
-    row.append(open, activityBadge(item), remove); list.append(row);
+    row.append(choice, open, activityBadge(item), remove); list.append(row);
   }
   $('history-list').replaceChildren(list); $('history-empty').hidden = !!items.length;
+  if (focusAfterRefresh) focusAfterRefresh.focus({ preventScroll: true });
+  paintActivitySelection();
+}
+async function refreshActivity() {
+  if (state.activityDeleting) return;
+  const request = ++state.activityRequest;
+  const items = await api('/api/activity'); if (!state.authenticated || request !== state.activityRequest || state.activityDeleting) return;
+  state.activity = items; renderActivityRows();
 
   const recent = document.createDocumentFragment();
   for (const item of items.slice(0, 3)) {
@@ -418,6 +462,14 @@ $('login-form').addEventListener('submit', async (event) => {
 $('logout').addEventListener('click', async () => { try { await api('/api/logout', { method: 'POST', body: '{}' }); state.selected = null; state.sfSelected = null; state.activity = []; state.query = ''; state.offset = 0; state.sfQuery = ''; state.sfOffset = 0; $('filter').value = ''; $('sf-filter').value = ''; paintScan(); paintSfScan(); message('scan-note', ''); message('sf-note', ''); showLogin(); } catch (error) { reportError(error); } });
 $('first-scan').addEventListener('click', () => { setTab('discovery'); $('domain').focus(); });
 $('refresh-history').addEventListener('click', () => refreshActivity().catch(reportError));
+$('history-select-all').addEventListener('change', () => {
+  if (state.activityDeleting) return;
+  state.activitySelection.clear();
+  if ($('history-select-all').checked) for (const item of state.activity.filter(canDeleteActivity)) state.activitySelection.add(activityKey(item));
+  renderActivityRows();
+});
+$('history-clear-selection').addEventListener('click', () => { state.activitySelection.clear(); renderActivityRows(); });
+$('history-delete-selected').addEventListener('click', () => deleteActivities(state.activity.filter(item => state.activitySelection.has(activityKey(item)))));
 
 $('scan-form').addEventListener('submit', async (event) => {
   event.preventDefault(); $('start').disabled = true; message('app-error', '');
