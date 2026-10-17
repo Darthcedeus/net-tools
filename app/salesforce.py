@@ -23,7 +23,7 @@ from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
 # Paths that commonly expose the Aura message endpoint, relative to the site
 # root or to a discovered application prefix such as /partners or /support.
-AURA_PATHS = ('/aura', '/s/sfsites/aura', '/sfsites/aura')
+AURA_PATHS = ('/s/sfsites/aura', '/s/aura', '/aura', '/sfsites/aura')
 
 # Strings that identify a Salesforce Aura/Lightning (Experience Cloud) site in
 # the landing page markup or inline bootstrap script.
@@ -36,7 +36,7 @@ AURA_RESPONSE_MARKERS = ('aura:invalidSession', 'aura:clientOutOfSync', 'markup:
                          '"exceptionEvent"', 'AuraEnabled', 'clientOutOfSync',
                          'ClientSideEventException')
 
-DEFAULT_APP = 'siteforce:communityApp'
+DEFAULT_APP = 'siteforce:loginApp2'
 MAX_BYTES = 2_000_000
 MAX_REDIRECTS = 4
 SAMPLE_FIELD_LIMIT = 24
@@ -50,8 +50,7 @@ DEFAULT_OBJECTS = (
     'Campaign', 'CampaignMember', 'Task', 'Event', 'Group', 'Product2',
 )
 
-GET_CONFIG_DESCRIPTOR = ('serviceComponent://ui.force.components.controllers.'
-                         'hostConfig.HostConfigController/ACTION$getConfigData')
+GET_CONFIG_DESCRIPTOR = 'aura://HostConfigController/ACTION$getConfigData'
 GET_ITEMS_DESCRIPTOR = ('serviceComponent://ui.force.components.controllers.lists.'
                         'selectableListDataProvider.SelectableListDataProviderController/'
                         'ACTION$getItems')
@@ -99,8 +98,8 @@ def _addresses_are_public(host, port):
 def safe_target(url):
     """Validate and normalize a user-supplied target URL.
 
-    Returns the normalized ``scheme://host[:port]`` origin. Raises ValueError
-    for anything that is not a public http(s) host, which blocks attempts to
+    Returns the normalized URL, preserving its application path and query.
+    Raises ValueError for anything that is not a public http(s) host, blocking
     scan loopback, private, link-local, and cloud-metadata addresses.
     """
     if not isinstance(url, str) or not url.strip():
@@ -127,7 +126,7 @@ def safe_target(url):
         raise ValueError('Enter a valid target port.')
     _addresses_are_public(host, port)
     netloc = host if parsed.port is None else f'{host}:{parsed.port}'
-    return urlunsplit((parsed.scheme, netloc, '', '', ''))
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ''))
 
 
 def guarded_fetch(method, url, headers=None, data=None, timeout=10, max_bytes=MAX_BYTES):
@@ -159,8 +158,12 @@ def guarded_fetch(method, url, headers=None, data=None, timeout=10, max_bytes=MA
             if (following.hostname or '').lower() != (parsed.hostname or '').lower():
                 raise ValueError('Refusing to follow a redirect to another host.') from None
             current = urlunsplit(following)
-            data = None
-            method = 'GET'
+            # Aura deployments can canonicalize POST endpoints with 301/302.
+            # Reissue the POST there, as AuraInspector does. 307/308 also
+            # preserve the method/body; only 303 explicitly switches to GET.
+            if redirect.code == 303:
+                data = None
+                method = 'GET'
             continue
         except urllib.error.HTTPError as error:
             body = error.read(max_bytes + 1)[:max_bytes] if error.fp else b''
@@ -171,13 +174,14 @@ def guarded_fetch(method, url, headers=None, data=None, timeout=10, max_bytes=MA
 
 
 class _Redirect(Exception):
-    def __init__(self, headers):
+    def __init__(self, headers, code):
         self.headers = headers
+        self.code = code
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise _Redirect(headers)
+        raise _Redirect(headers, code)
 
 
 class Detector:
@@ -198,12 +202,14 @@ class Detector:
         ``emit`` is called as ``emit(kind, payload)`` with kind in
         {"meta", "finding"}. Returns a summary dict with the final verdict.
         """
-        origin = safe_target(target)
+        target = safe_target(target)
+        parsed = urlsplit(target)
+        origin = urlunsplit((parsed.scheme, parsed.netloc, '', '', ''))
         summary = {'is_salesforce': False, 'aura_endpoint': None, 'verdict': 'not_salesforce',
                    'app': None, 'fwuid': None, 'self_registration': False,
                    'objects_checked': 0, 'objects_readable': 0}
 
-        landing = self._fingerprint(origin, cancel)
+        landing = self._fingerprint(target, cancel)
         summary.update(landing)
         emit('meta', dict(summary))
         if cancel():
@@ -241,23 +247,41 @@ class Detector:
 
     # -- fingerprint --------------------------------------------------------
 
-    def _fingerprint(self, origin, cancel):
+    def _fingerprint(self, target, cancel):
         info = {'app': None, 'fwuid': None, 'app_id': None, 'self_registration': False,
                 'app_prefixes': [], 'custom_objects': []}
+        self._extract_path(target, info)
+        if cancel():
+            return info
         try:
-            result = self.fetch('GET', origin + '/', timeout=self.request_timeout)
+            result = self.fetch('GET', target, timeout=self.request_timeout)
         except DetectorError:
             return info
+        self._extract_path(result.url, info)
         body = result.text()
         info['fingerprint'] = any(marker in body for marker in HTML_MARKERS)
         self._extract_bootstrap(body, info)
         info['self_registration'] = 'SelfRegister' in body or 'self_register' in body
         return info
 
+    def _extract_path(self, url, info):
+        """Keep community prefixes from input and canonical landing URLs."""
+        path = urlsplit(url).path.rstrip('/')
+        prefix = path
+        for suffix in AURA_PATHS:
+            if path.endswith(suffix):
+                prefix = path[:-len(suffix)]
+                break
+        else:
+            match = re.search(r'/s(?:/|$)', path)
+            if match:
+                prefix = path[:match.start()]
+        if prefix and prefix not in info['app_prefixes']:
+            info['app_prefixes'].append(prefix)
+
     def _extract_bootstrap(self, body, info):
         fwuid = re.search(r'"fwuid"\s*:\s*"([^"]{4,120})"', body) or \
-            re.search(r'/auraFW/javascript/([^/"\\]{4,120})/', body) or \
-            re.search(r'/l/([^/"\\]{4,120})/', body)
+            re.search(r'/auraFW/javascript/([^/"\\]{4,120})/', body)
         if fwuid:
             info['fwuid'] = fwuid.group(1)
         app = re.search(r'"app"\s*:\s*"([^"]{3,120})"', body) or \
@@ -269,9 +293,8 @@ class Detector:
         if loaded:
             info['app'] = info['app'] or loaded.group(1).split('://', 1)[-1]
             info['app_id'] = loaded.group(2)
-        for match in re.findall(r'/([A-Za-z0-9_]+)/s(?:/|")', body):
-            prefix = '/' + match
-            if prefix not in info['app_prefixes'] and match not in ('sfsites', 'auraFW'):
+        for prefix in re.findall(r'(/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*)/s(?:/|["\'])', body):
+            if prefix not in info['app_prefixes'] and prefix not in ('/sfsites', '/auraFW'):
                 info['app_prefixes'].append(prefix)
         for match in set(re.findall(r'"apiName"\s*:\s*"([A-Za-z0-9_]+__c)"', body)):
             if match not in info['custom_objects']:
@@ -283,7 +306,7 @@ class Detector:
         app = landing.get('app') or DEFAULT_APP
         fwuid = landing.get('fwuid')
         context = self._context(app, fwuid, landing.get('app_id'))
-        prefixes = [''] + landing.get('app_prefixes', [])
+        prefixes = landing.get('app_prefixes', []) + ['']
         for prefix in prefixes:
             for path in AURA_PATHS:
                 if cancel():
@@ -298,11 +321,34 @@ class Detector:
                 refreshed = self._refresh_fwuid(text, context)
                 if refreshed and refreshed != context['fwuid']:
                     context['fwuid'] = refreshed
-                return endpoint, context
+                # A root landing page often lacks the community bootstrap.
+                # Read the app associated with the confirmed endpoint before
+                # sending object requests, following AuraInspector's approach.
+                if not landing.get('app') or not landing.get('fwuid'):
+                    bootstrap = self._fingerprint(self._app_url(probe.url), cancel)
+                    context = self._context(bootstrap.get('app') or app,
+                                            refreshed or bootstrap.get('fwuid') or context['fwuid'],
+                                            bootstrap.get('app_id') or landing.get('app_id'))
+                    for name in bootstrap.get('custom_objects', []):
+                        if name not in landing['custom_objects']:
+                            landing['custom_objects'].append(name)
+                return probe.url, context
         return None, context
+
+    @staticmethod
+    def _app_url(endpoint):
+        parsed = urlsplit(endpoint)
+        path = parsed.path.rstrip('/')
+        for suffix in AURA_PATHS:
+            if path.endswith(suffix):
+                path = path[:-len(suffix)]
+                break
+        return urlunsplit((parsed.scheme, parsed.netloc, path + '/s', '', ''))
 
     def _looks_like_aura(self, text):
         """A live Aura endpoint echoes framework markers or a message envelope."""
+        if re.search(r'<(?:!doctype|html|head|body|script)\b', text, re.I):
+            return False
         if any(marker in text for marker in AURA_RESPONSE_MARKERS):
             return True
         try:
@@ -314,15 +360,15 @@ class Detector:
 
     def _refresh_fwuid(self, text, context):
         match = re.search(r'"newFwuid"\s*:\s*"([^"]+)"', text) or \
-            re.search(r'Expected:\s*([\w-]+)\s+Actual', text) or \
+            re.search(r'Expected:\s*(\S+)\s+Actual', text) or \
             re.search(r'"fwuid"\s*:\s*"([^"]+)"', text)
         return match.group(1) if match else None
 
     def _context(self, app, fwuid, app_id):
         loaded = {}
-        if app_id:
-            loaded[f'APPLICATION@markup://{app}'] = app_id
-        return {'mode': 'PROD', 'fwuid': fwuid or '', 'app': app,
+        if app_id or app == DEFAULT_APP:
+            loaded[f'APPLICATION@markup://{app}'] = app_id or app
+        return {'mode': 'PROD', 'fwuid': fwuid or 'INVALID', 'app': app,
                 'loaded': loaded, 'dn': [], 'globals': {}, 'uad': False}
 
     # -- object enumeration -------------------------------------------------
@@ -407,7 +453,8 @@ class Detector:
             return None
         payload = urlencode({'message': json.dumps({'actions': actions}),
                              'aura.context': json.dumps(context),
-                             'aura.pageURI': '/', 'aura.token': 'undefined'}).encode()
+                             'aura.pageURI': urlsplit(self._app_url(endpoint)).path,
+                             'aura.token': 'undefined'}).encode()
         headers = {'Content-Type': 'application/x-www-form-urlencoded',
                    'X-SFDC-Aura-Mode': 'PROD', 'Accept': 'application/json',
                    'User-Agent': 'NetTools-SalesforceDetector/1.0'}
@@ -423,7 +470,11 @@ class Detector:
         except (ValueError, TypeError):
             return None
         for action in data.get('actions', []) if isinstance(data, dict) else []:
-            if isinstance(action, dict) and needle in str(action.get('descriptor', '')):
+            # Aura responses identify actions by request id; descriptor is not
+            # guaranteed to be echoed (the old test fixture always added it).
+            action_id = {'getConfigData': '1;a', 'getItems': '2;a'}.get(needle)
+            if isinstance(action, dict) and (action.get('id') == action_id or
+                                            needle in str(action.get('descriptor', ''))):
                 return action
         return None
 
@@ -432,3 +483,4 @@ class Detector:
         if action and action.get('state') == 'SUCCESS':
             return action.get('returnValue')
         return None
+

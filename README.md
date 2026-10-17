@@ -6,6 +6,8 @@ The home page shows the tool directory and recent activity. Open Subdomain Finde
 
 **Salesforce Detector** checks whether a site runs the Salesforce Aura/Lightning framework (Experience Cloud) and whether its guest user leaks data. Enter one target URL; the detector fingerprints the site, probes the unauthenticated Aura endpoint, and enumerates which standard and custom objects are readable by an anonymous guest, recording each object's total record count and a small sample of records (5–10 by default) as evidence. It is read-only — it counts and samples, never dumping full datasets — and classifies each target as *Not Salesforce*, *Salesforce* (guest access locked down), or *Leaking*. Only scan sites you own or are authorized to test. The checks combine the approach of Mandiant's [AuraInspector](https://github.com/google/aura-inspector) with related guest-access research. A built-in guard rejects private, loopback, link-local, and reserved addresses, so an internet-exposed instance cannot be aimed at internal services.
 
+For communities hosted under a path, enter the full community URL, such as `https://example.com/partners/s/`. The detector preserves that path, checks the Aura endpoint variants beneath the community prefix, and reports the final endpoint URL after same-host redirects.
+
 | Page | Route | Status |
 | --- | --- | --- |
 | Home / tool directory | `/` | Available |
@@ -179,3 +181,4 @@ The app is a single-process, single-user utility. Run one replica per data volum
 ## Extending the suite
 
 `app/static/tools.js` is the frontend tool catalog, including display names, descriptions, availability, and routes. The shell handles navigation and shared activity; existing Subdomain Finder endpoints remain under `/api/scans`. New tools should add their own view and API handler, then register an available route in the catalog and the server page allowlist. Persist each new tool’s results in its own model and include its tool identity when adding records to shared activity. The current scan store identifies existing records as `subdomains` without changing the database schema.
+
