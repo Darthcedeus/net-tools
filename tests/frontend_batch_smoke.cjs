@@ -18,7 +18,7 @@ class Element {
   async fire(name) { for (const cb of this.listeners[name] || []) await cb({ preventDefault() {}, target: this }); }
   querySelector(tag) { return this.children.find(n => n.tag === tag) || new Element(tag); }
   reportValidity() { return true; }
-  focus() {} scrollIntoView() {} remove() {} click() {}
+  focus() { doc.activeElement = this; } scrollIntoView() {} remove() {} click() {}
 }
 const elements = Object.fromEntries(ids.map(id => [id, new Element()]));
 elements['batch-sample-size'].value = '10'; elements['batch-max-objects'].value = '50';
@@ -28,11 +28,21 @@ const sourceId = 'f'.repeat(32), location = { pathname: '/tools/subdomains', sea
 const source = { id: sourceId, domain: 'example.com', status: 'completed', count: 201, options: {}, created: 1, started: 1, finished: 2 };
 const hosts = [{ host: 'api.example.com', sources: ['fixture'], ips: [], dns_status: 'no_records' }, { host: 'support.example.com', sources: ['fixture'], ips: [], dns_status: 'no_records' }];
 const batches = [], sent = [];
+let activity = [], confirmDelete = true, deleteConflict = false;
+const deletionRequests = [], confirmations = [];
 const summary = b => { const { items, ...rest } = b; return rest; };
 async function fetch(path, options = {}) {
   let value;
   if (path === '/api/session') value = { authenticated: true, csrf: 'test', engine_available: true };
-  else if (path === '/api/activity') value = [];
+  else if (path === '/api/activity') value = activity;
+  else if (path === '/api/activity/delete') {
+    const payload = JSON.parse(options.body); deletionRequests.push(payload);
+    if (deleteConflict) return { ok: false, status: 409, json: async () => ({ error: 'Activity changed. Nothing was deleted.' }) };
+    assert(payload.items.every(item => activity.some(a => a.id === item.id && a.delete_kind === item.kind && a.deletable)));
+    const sources = new Set(payload.items.filter(i => i.kind === 'subdomains').map(i => i.id));
+    activity = activity.filter(a => !payload.items.some(i => i.id === a.id && i.kind === a.delete_kind) && !(a.batch_id && sources.has(a.source_scan_id)));
+    value = { deleted: payload.items.length };
+  }
   else if (path === '/api/scans/' + sourceId) value = source;
   else if (path.startsWith('/api/scans/' + sourceId + '/results')) { const query = new URL(path, 'http://local').searchParams.get('q'); value = { total: query === 'support' ? 1 : 201, items: query === 'support' ? hosts.slice(1) : hosts }; }
   else if (path === '/api/scans/' + sourceId + '/sf-batches') {
@@ -54,7 +64,7 @@ async function fetch(path, options = {}) {
 }
 const timers = new Map(); let timerId = 0;
 const win = { scrollTo() {}, addEventListener() {}, history: { pushState(_, __, url) { const parsed = new URL(url, 'http://local'); location.pathname = parsed.pathname; location.search = parsed.search; }, replaceState(...args) { this.pushState(...args); } } };
-const context = vm.createContext({ document: doc, window: win, location, fetch, URL, URLSearchParams, console, matchMedia: () => ({ matches: true }), navigator: {}, confirm: () => true,
+const context = vm.createContext({ document: doc, window: win, location, fetch, URL, URLSearchParams, console, matchMedia: () => ({ matches: true }), navigator: {}, confirm: text => { confirmations.push(text); return confirmDelete; },
   setInterval() {}, clearTimeout(id) { timers.delete(id); }, setTimeout(cb, delay) { const id = ++timerId; timers.set(id, { cb, delay }); return id; },
   SUBDOMAINS: { path: '/tools/subdomains', name: 'Subdomain Finder' }, SALESFORCE: { path: '/tools/salesforce', name: 'Salesforce Detector' }, renderToolDirectory() {}, toolName: x => x });
 const code = fs.readFileSync(root + '/app/static/app.js', 'utf8').replace(/^import .*;$/m, '');
@@ -75,5 +85,33 @@ async function settle() { for (let i = 0; i < 30; i++) await new Promise(resolve
   await elements['sf-batch-cancel'].fire('click'); await settle(); assert.equal(elements['sf-batch-cancel'].hidden, true);
   const open = elements['sf-batch-rows'].children[0].children[3].children[0]; await open.fire('click'); await settle();
   assert.equal(location.pathname, '/tools/salesforce'); assert.match(elements['sf-target'].textContent, /support.example.com/);
-  console.log('PASS: HTML ids, module startup, >100 limit, selected-host payload, filtered payload, batch progress, cancellation and Open result navigation. DOM simulation only; no rendered layout assertion.');
+  const record = (id, tool, extra = {}) => ({ id: id.repeat(32), tool, label: `${id}.example.com`, created: 1, started: 1, finished: 2, status: 'completed', count: 0, verdict: null, delete_kind: tool, deletable: true, ...extra });
+  activity = [record('a', 'subdomains'), record('b', 'salesforce'), record('c', 'salesforce', { batch_id: 'c'.repeat(32), source_scan_id: 'a'.repeat(32), delete_kind: 'salesforce_batch', total: 1, leaking: 0 }),
+    record('d', 'salesforce', { status: 'running', deletable: false }), record('e', 'subdomains', { deletable: false }),
+    record('9', 'salesforce', { batch_id: '9'.repeat(32), source_scan_id: 'e'.repeat(32), status: 'queued', delete_kind: 'salesforce_batch', deletable: false, total: 1, leaking: 0 })];
+  await elements['refresh-history'].fire('click'); await settle();
+  assert.equal(elements['history-list'].children.length, 6);
+  assert.equal(elements['history-list'].children[4].children[0].disabled, true, 'source with active batch is protected');
+  let activityChoice = elements['history-list'].children[0].children[0]; activityChoice.checked = true; await activityChoice.fire('change');
+  assert.equal(elements['history-selection-count'].textContent, '1 selected');
+  assert.equal(elements['history-select-all'].indeterminate, true);
+  activityChoice.focus();
+  await elements['refresh-history'].fire('click'); await settle();
+  assert.equal(elements['history-list'].children[0].children[0].checked, true, 'selection survives polling');
+  assert.equal(doc.activeElement, elements['history-list'].children[0].children[0], 'checkbox keyboard focus survives polling');
+  await elements['history-clear-selection'].fire('click'); assert.equal(elements['history-selection-count'].textContent, '0 selected');
+  elements['history-select-all'].checked = true; await elements['history-select-all'].fire('change');
+  assert.equal(elements['history-selection-count'].textContent, '3 selected');
+  confirmDelete = false; await elements['history-delete-selected'].fire('click'); assert.equal(deletionRequests.length, 0, 'cancelled confirmation must not mutate');
+  confirmDelete = true; deleteConflict = true;
+  await elements['history-delete-selected'].fire('click'); await settle();
+  assert.equal(elements['history-selection-count'].textContent, '3 selected', 'failed deletion preserves selection');
+  assert.match(elements['app-error'].textContent, /Nothing was deleted/);
+  deleteConflict = false; await elements['history-delete-selected'].fire('click'); await settle();
+  assert.deepEqual(deletionRequests.at(-1).items.map(i => i.kind), ['subdomains', 'salesforce', 'salesforce_batch']);
+  assert.match(confirmations.at(-1), /also deletes its Salesforce batches/);
+  assert.equal(elements['history-list'].children.length, 3); assert.equal(elements['history-delete-selected'].disabled, true);
+  assert.equal(elements['history-selection-count'].textContent, '0 selected');
+  assert.equal(elements['app-error'].hidden, true, 'successful retry clears the earlier conflict');
+  console.log('PASS: Batch selection/filtering, progress, cancellation, result navigation; Activity multi-selection, select all, protected rows, refresh persistence, confirmation, conflict handling and mixed bulk deletion. DOM simulation only; no rendered layout assertion.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

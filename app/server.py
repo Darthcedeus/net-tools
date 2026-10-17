@@ -299,6 +299,18 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(200, {'ok': True})
             if path == '/api/activity' and method == 'GET':
                 return self.send(200, self.app.store.activity())
+            if path == '/api/activity/delete' and method == 'POST':
+                data = self.body(max_bytes=65536)
+                items = data.get('items')
+                if (not isinstance(items, list) or not 1 <= len(items) <= 500 or any(
+                        not isinstance(item, dict) or item.get('kind') not in ('subdomains', 'salesforce', 'salesforce_batch')
+                        or not isinstance(item.get('id'), str) or not re.fullmatch(r'[a-f0-9]{32}', item['id']) for item in items)):
+                    raise APIError(400, 'Select between 1 and 500 valid activities.')
+                try:
+                    result = self.app.store.delete_activities(items)
+                except ValueError as error:
+                    raise APIError(409, str(error)) from None
+                return self.send(200, result)
             if path == '/api/sf-scans':
                 if method == 'GET':
                     return self.send(200, self.app.store.sf_history())
