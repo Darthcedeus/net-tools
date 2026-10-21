@@ -84,6 +84,7 @@
               <label>Sample records <span class="unit">per object</span><input id="batch-sample-size" type="number" min="1" max="25" value="10" required></label>
               <label>Object limit <span class="unit">per host</span><input id="batch-max-objects" type="number" min="1" max="200" value="50" required></label>
             </div>
+            <label class="tls-option"><input id="batch-ignore-tls" type="checkbox"> Ignore TLS errors for this batch</label><p class="help">Skips certificate and hostname validation for every host in this batch.</p>
             <div class="batch-actions"><button id="sf-scan-selected" class="button">Scan selected (0)</button><button id="sf-scan-matching" class="button primary">Scan all matching (0)</button><button id="sf-clear-selection" class="button small">Clear selection</button></div>
             <p class="help" id="sf-bulk-scope"></p>
           </section>
@@ -106,6 +107,7 @@
               <label>Sample records <span class="unit">per object</span><input id="sf-sample-size" type="number" min="1" max="25" value="10" required></label>
               <label>Object limit <span class="unit">objects</span><input id="sf-max-objects" type="number" min="1" max="200" value="50" required></label>
             </div>
+            <label class="tls-option"><input id="sf-ignore-tls" type="checkbox"> Ignore TLS errors for this scan</label><p class="help">Skips certificate and hostname validation. Results may come from an unverified server.</p>
             <p class="help">Read-only: the detector counts accessible objects and keeps a few sample records as evidence. It never dumps full datasets.</p>
           </details>
           <div class="form-foot">Guest-access check · Inspired by <a href="https://github.com/google/aura-inspector" target="_blank" rel="noopener noreferrer">AuraInspector</a></div>
@@ -114,6 +116,7 @@
           <div class="section-top"><h2 id="sf-results-title">Detection results</h2><span id="sf-status" class="status" hidden></span></div>
           <div class="scan-summary" id="sf-summary" hidden><div><p>Target: <strong id="sf-target" class="mono"></strong></p><p class="muted" id="sf-stats"></p></div><div class="scan-actions"><button class="button small" id="sf-rerun">Run again</button><button class="button small danger" id="sf-cancel" hidden>Cancel scan</button></div></div>
           <p id="sf-verdict" class="notice" role="status" hidden></p>
+          <details id="sf-diagnostics" hidden><summary>Connection diagnostics</summary><ul id="sf-diagnostic-list"></ul></details>
           <p id="sf-note" class="notice" role="status" hidden></p>
           <div id="sf-tools" class="toolbar" hidden>
             <div class="search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m16 16 4.5 4.5"></path></svg><input id="sf-filter" aria-label="Filter objects" placeholder="Filter objects…" autocomplete="off" spellcheck="false"></div>

@@ -14,7 +14,7 @@ const ROUTES = { home: '/', discovery: SUBDOMAINS.path, salesforce: SALESFORCE.p
 const PAGE_TITLES = { home: 'Home', discovery: SUBDOMAINS.name, salesforce: SALESFORCE.name, history: 'Activity' };
 const active = (scan) => scan && ['queued', 'running'].includes(scan.status);
 const statuses = { completed: 'Completed', running: 'Scanning', queued: 'Queued', cancelled: 'Cancelled', failed: 'Failed', timed_out: 'Timed out', interrupted: 'Interrupted', limited: 'Result limit reached' };
-const verdicts = { leaking: 'Leaking', salesforce: 'Salesforce', not_salesforce: 'Not Salesforce' };
+const verdicts = { leaking: 'Leaking', salesforce: 'Aura endpoint confirmed', salesforce_detected: 'Salesforce detected', unable_to_verify: 'Unable to verify', not_salesforce: 'No Salesforce detected' };
 const verdictClass = { leaking: 'verdict-leaking', salesforce: 'verdict-ok', not_salesforce: 'verdict-none' };
 let filterTimer, sfFilterTimer, toastTimer;
 
@@ -230,7 +230,7 @@ async function startBatch(selected) {
   if (!state.selected || state.batchBusy) return;
   if (!$('batch-sample-size').reportValidity() || !$('batch-max-objects').reportValidity()) return;
   const sourceId = state.selected.id, generation = state.generation;
-  const data = { sample_size: Number($('batch-sample-size').value), max_objects: Number($('batch-max-objects').value),
+  const data = { sample_size: Number($('batch-sample-size').value), max_objects: Number($('batch-max-objects').value), ignore_tls_errors: $('batch-ignore-tls').checked,
     ...(selected ? { hosts: [...state.selectedHosts] } : { q: state.query }) };
   state.batchBusy = true; paintBatchActions(); message('app-error', '');
   try {
@@ -249,20 +249,27 @@ function sfTargetHost(url) { try { return new URL(url).host; } catch { return ur
 function paintSfScan() {
   const scan = state.sfSelected;
   $('sf-summary').hidden = !scan; $('sf-status').hidden = !scan; $('sf-tools').hidden = !scan;
-  if (!scan) { $('sf-table').hidden = true; $('sf-pagination').hidden = true; $('sf-empty').hidden = false; $('sf-verdict').hidden = true; return; }
+  if (!scan) { $('sf-diagnostics').hidden = true; $('sf-table').hidden = true; $('sf-pagination').hidden = true; $('sf-empty').hidden = false; $('sf-verdict').hidden = true; return; }
   $('sf-status').className = 'status ' + scan.status; $('sf-status').textContent = statuses[scan.status] || scan.status;
   $('sf-target').textContent = sfTargetHost(scan.url);
   const noun = `${scan.count.toLocaleString()} readable object${scan.count === 1 ? '' : 's'}`;
   $('sf-stats').textContent = `${noun} · ${elapsed(scan)}`;
   $('sf-cancel').hidden = !active(scan); $('sf-rerun').hidden = active(scan);
   const details = scan.details || {};
+  const diagnostics = [...(details.discovery?.errors || []), ...(details.connection_errors || [])];
+  $('sf-diagnostics').hidden = !diagnostics.length;
+  $('sf-diagnostic-list').replaceChildren(...diagnostics.map(error => { const row = document.createElement('li'); row.textContent = `${error.method} ${error.url}: ${error.message}`; return row; }));
   const finished = !active(scan);
   if (finished && scan.verdict) {
     const label = verdicts[scan.verdict] || scan.verdict;
     const parts = [];
     if (scan.verdict === 'leaking') parts.push(`Guest access is leaking data — ${noun} readable.`);
-    else if (scan.verdict === 'salesforce') parts.push('Salesforce Aura detected; no guest-readable objects found.');
-    else parts.push('No Salesforce Aura endpoint detected.');
+    else if (scan.verdict === 'salesforce') parts.push('Salesforce Aura detected; no guest-readable objects found in the checks completed.');
+    else if (scan.verdict === 'salesforce_detected') parts.push('Salesforce page markers found; no Aura endpoint confirmed. Guest access could not be assessed.');
+    else if (scan.verdict === 'unable_to_verify') parts.push('Connection failures or discovery limits prevented a conclusive check.');
+    else parts.push('No Salesforce markers or Aura endpoint found in the locations checked.');
+    if (scan.options.ignore_tls_errors) parts.push('TLS certificate verification was disabled.');
+    if (diagnostics.length) parts.push('See connection diagnostics for failed requests. Guest-access checks may be incomplete.');
     if (scan.aura_endpoint) parts.push(`Aura endpoint: ${scan.aura_endpoint}`);
     if (details.self_registration) parts.push('Self-registration appears enabled.');
     $('sf-verdict').className = 'notice ' + (verdictClass[scan.verdict] || '');
@@ -315,8 +322,8 @@ async function refreshSfResults() {
   $('sf-rows').replaceChildren(fragment);
   $('sf-table').hidden = !results.items.length; $('sf-empty').hidden = !!results.items.length;
   if (!results.items.length) {
-    $('sf-empty').querySelector('h3').textContent = query ? 'No matching objects.' : active(scan) ? 'Scanning…' : scan.is_salesforce ? 'No objects enumerated.' : 'No Salesforce Aura endpoint found.';
-    $('sf-empty').querySelector('p').textContent = query ? 'Try a different filter.' : active(scan) ? 'Objects appear here as the guest-access probe runs.' : scan.is_salesforce ? 'The site runs Salesforce Aura but no objects were readable as a guest.' : 'This target does not appear to expose a Salesforce Aura/Lightning endpoint.';
+    $('sf-empty').querySelector('h3').textContent = query ? 'No matching objects.' : active(scan) ? 'Scanning…' : scan.verdict === 'unable_to_verify' ? 'Unable to verify this site.' : scan.is_salesforce ? 'No objects enumerated.' : 'No Salesforce Aura endpoint found.';
+    $('sf-empty').querySelector('p').textContent = query ? 'Try a different filter.' : active(scan) ? 'Objects appear here as the guest-access probe runs.' : scan.verdict === 'unable_to_verify' ? 'The scan could not conclusively check this site. See connection diagnostics and scan details.' : !scan.aura_endpoint ? 'No Aura endpoint was confirmed, so guest access could not be assessed.' : 'No guest-readable objects were found in the checks completed.';
   }
   $('sf-pagination').hidden = !results.total;
   $('sf-page-label').textContent = `${(offset + 1).toLocaleString()}–${(offset + results.items.length).toLocaleString()} of ${results.total.toLocaleString()}${query ? ' matching' : ''} object${results.total === 1 ? '' : 's'}`;
@@ -521,7 +528,7 @@ $('export').addEventListener('change', async () => {
 
 $('sf-form').addEventListener('submit', async (event) => {
   event.preventDefault(); $('sf-start').disabled = true; message('app-error', '');
-  const options = { url: $('sf-url').value, sample_size: Number($('sf-sample-size').value), max_objects: Number($('sf-max-objects').value) };
+  const options = { url: $('sf-url').value, sample_size: Number($('sf-sample-size').value), max_objects: Number($('sf-max-objects').value), ignore_tls_errors: $('sf-ignore-tls').checked };
   try { const scan = await api('/api/sf-scans', { method: 'POST', body: JSON.stringify(options) }); $('sf-url').value = scan.url; await selectSfScan(scan); await refreshActivity(); }
   catch (error) { reportError(error); } finally { $('sf-start').disabled = false; }
 });
@@ -533,6 +540,7 @@ $('sf-cancel').addEventListener('click', async () => {
 $('sf-rerun').addEventListener('click', () => {
   const scan = state.sfSelected; if (!scan) return;
   $('sf-url').value = scan.url; $('sf-sample-size').value = scan.options.sample_size; $('sf-max-objects').value = scan.options.max_objects;
+  $('sf-ignore-tls').checked = !!scan.options.ignore_tls_errors;
   $('sf-url').focus(); $('sf-form').scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth', block: 'center' }); toast('Options restored. Press Scan site to run again.');
 });
 $('sf-filter').addEventListener('input', () => { state.sfQuery = $('sf-filter').value.trim(); state.sfOffset = 0; clearTimeout(sfFilterTimer); sfFilterTimer = setTimeout(() => refreshSfResults().catch(reportError), 200); });

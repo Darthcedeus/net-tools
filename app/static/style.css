@@ -1125,3 +1125,7 @@ td>details>summary {
   overflow-wrap:anywhere;
 }
 
+
+.tls-option { display:flex; align-items:center; gap:10px; margin-top:12px; }
+.tls-option input { width:18px; min-height:18px; flex:0 0 18px; accent-color:var(--accent); }
+#sf-diagnostics { margin:12px 0; overflow-wrap:anywhere; }
