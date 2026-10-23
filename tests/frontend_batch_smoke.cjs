@@ -28,6 +28,7 @@ const sourceId = 'f'.repeat(32), location = { pathname: '/tools/subdomains', sea
 const source = { id: sourceId, domain: 'example.com', status: 'completed', count: 201, options: {}, created: 1, started: 1, finished: 2 };
 const hosts = [{ host: 'api.example.com', sources: ['fixture'], ips: [], dns_status: 'no_records' }, { host: 'support.example.com', sources: ['fixture'], ips: [], dns_status: 'no_records' }];
 const batches = [], sent = [];
+const reachBatches = [], reachSent = [];
 let activity = [], confirmDelete = true, deleteConflict = false;
 const deletionRequests = [], confirmations = [];
 const summary = b => { const { items, ...rest } = b; return rest; };
@@ -57,6 +58,18 @@ async function fetch(path, options = {}) {
   } else if (path.startsWith('/api/sf-batches/')) {
     const id = path.split('/')[3]; value = batches.find(b => b.id === id); assert(value);
     if (path.endsWith('/cancel')) { value.status = 'cancelled'; value.cancel_requested = true; value.cancelled = 1; value.done = 1; value.items[0].status = 'cancelled'; }
+  } else if (path === '/api/scans/' + sourceId + '/reach-batches') {
+    if (options.method === 'POST') {
+      const payload = JSON.parse(options.body); reachSent.push(payload); const n = reachBatches.length + 1;
+      const chosen = payload.hosts || ['api.example.com', 'support.example.com'];
+      const items = chosen.map((host, i) => ({ host, state: 'done', reachable: i === 0, scheme: i === 0 ? 'https' : null, status: i === 0 ? 200 : null, server: i === 0 ? 'nginx' : null, final_url: i === 0 ? 'https://' + host + '/' : null, error: i === 0 ? null : 'refused', elapsed_ms: 5, details: {} }));
+      value = { id: ('a' + n).repeat(16), source_scan_id: sourceId, source_domain: 'example.com', created: n, started: 1, finished: 2, status: 'completed',
+        total: items.length, done: items.length, reachable: items.filter(x => x.reachable).length, unreachable: items.filter(x => !x.reachable).length, cancel_requested: false, query: payload.q || '', error: null, items };
+      reachBatches.unshift(value);
+    } else value = reachBatches.map(summary);
+  } else if (path.startsWith('/api/reach-batches/')) {
+    const id = path.split('/')[3]; value = reachBatches.find(b => b.id === id); assert(value);
+    if (path.endsWith('/cancel')) { value.status = 'cancelled'; value.cancel_requested = true; }
   } else if (path.includes('/findings?')) value = { total: 0, items: [] };
   else if (path.startsWith('/api/sf-scans/')) { value = batches.flatMap(b => b.items).find(s => s.id === path.split('/')[3]); assert(value); }
   else throw new Error('Unexpected API path ' + path);
@@ -83,6 +96,20 @@ async function settle() { for (let i = 0; i < 30; i++) await new Promise(resolve
   await elements['sf-scan-matching'].fire('click'); await settle(); assert.equal(sent[1].q, 'support'); assert(!('hosts' in sent[1]));
   assert.equal(elements['sf-scan-selected'].disabled, true, 'active batch blocks another launch');
   await elements['sf-batch-cancel'].fire('click'); await settle(); assert.equal(elements['sf-batch-cancel'].hidden, true);
+  // Reachability batch: select a host, check selected, then check all matching.
+  elements.filter.value = ''; await elements.filter.fire('input');
+  for (const [id, t] of [...timers]) if (t.delay === 200) { timers.delete(id); await t.cb(); }
+  await settle();
+  const reachBox = elements['result-rows'].children[0].children[0].children[0].children[0];
+  reachBox.checked = true; await reachBox.fire('change'); assert.equal(elements['reach-check-selected'].disabled, false);
+  await elements['reach-check-selected'].fire('click'); await settle();
+  assert.deepEqual(reachSent[0].hosts, ['api.example.com']);
+  assert.match(elements['reach-batch-progress'].textContent, /1 of 1 hosts checked · 1 reachable · 0 unreachable/);
+  assert.equal(elements['reach-batch-rows'].children.length, 1);
+  assert.equal(elements['reach-batch-rows'].children[0].children[1].children[0].textContent, 'HTTPS');
+  await elements['reach-check-matching'].fire('click'); await settle();
+  assert.equal(reachSent[1].q, ''); assert(!('hosts' in reachSent[1]));
+  assert.match(elements['reach-batch-progress'].textContent, /2 reachable · 1 unreachable|1 reachable · 1 unreachable/);
   const open = elements['sf-batch-rows'].children[0].children[3].children[0]; await open.fire('click'); await settle();
   assert.equal(location.pathname, '/tools/salesforce'); assert.match(elements['sf-target'].textContent, /support.example.com/);
   const record = (id, tool, extra = {}) => ({ id: id.repeat(32), tool, label: `${id}.example.com`, created: 1, started: 1, finished: 2, status: 'completed', count: 0, verdict: null, delete_kind: tool, deletable: true, ...extra });
@@ -109,7 +136,7 @@ async function settle() { for (let i = 0; i < 30; i++) await new Promise(resolve
   assert.match(elements['app-error'].textContent, /Nothing was deleted/);
   deleteConflict = false; await elements['history-delete-selected'].fire('click'); await settle();
   assert.deepEqual(deletionRequests.at(-1).items.map(i => i.kind), ['subdomains', 'salesforce', 'salesforce_batch']);
-  assert.match(confirmations.at(-1), /also deletes its Salesforce batches/);
+  assert.match(confirmations.at(-1), /also deletes its Salesforce and reachability batches/);
   assert.equal(elements['history-list'].children.length, 3); assert.equal(elements['history-delete-selected'].disabled, true);
   assert.equal(elements['history-selection-count'].textContent, '0 selected');
   assert.equal(elements['app-error'].hidden, true, 'successful retry clears the earlier conflict');

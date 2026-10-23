@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 MAX_SF_BATCH_HOSTS = 100
+MAX_REACH_HOSTS = 500
 
 
 class Store:
@@ -49,6 +50,24 @@ class Store:
                     samples TEXT NOT NULL DEFAULT '[]',
                     PRIMARY KEY (scan_id, object)
                 );
+                CREATE TABLE IF NOT EXISTS reach_batches (
+                    id TEXT PRIMARY KEY,
+                    source_scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                    source_domain TEXT NOT NULL, status TEXT NOT NULL,
+                    created REAL NOT NULL, started REAL, finished REAL,
+                    options TEXT NOT NULL, query TEXT NOT NULL DEFAULT '',
+                    error TEXT, total INTEGER NOT NULL DEFAULT 0,
+                    done INTEGER NOT NULL DEFAULT 0, cancelled INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS reach_results (
+                    batch_id TEXT NOT NULL REFERENCES reach_batches(id) ON DELETE CASCADE,
+                    host TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                    reachable INTEGER, scheme TEXT, status INTEGER, server TEXT,
+                    final_url TEXT, error TEXT, elapsed_ms INTEGER,
+                    details TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (batch_id, host)
+                );
+                CREATE INDEX IF NOT EXISTS reach_batch_state ON reach_results(batch_id, state);
             ''')
             columns = {r['name'] for r in db.execute('PRAGMA table_info(results)')}
             if 'ips' not in columns:
@@ -67,6 +86,9 @@ class Store:
             # running is marked interrupted rather than silently scanned twice.
             db.execute("UPDATE sf_scans SET status='interrupted', finished=?, error=? WHERE status='running' OR (status='queued' AND batch_id IS NULL)",
                        (time.time(), interrupted))
+            # A reachability batch that was mid-run resumes: its unfinished hosts
+            # stay pending and the runner re-queues the batch after restart.
+            db.execute("UPDATE reach_batches SET status='queued', started=NULL WHERE status='running'")
 
     @contextmanager
     def connect(self):
@@ -114,7 +136,7 @@ class Store:
 
     @staticmethod
     def _trim_subdomains(db):
-        db.execute("DELETE FROM scans WHERE id IN (SELECT id FROM scans WHERE status NOT IN ('queued','running') AND id NOT IN (SELECT source_scan_id FROM sf_batches) ORDER BY created DESC LIMIT -1 OFFSET 100)")
+        db.execute("DELETE FROM scans WHERE id IN (SELECT id FROM scans WHERE status NOT IN ('queued','running') AND id NOT IN (SELECT source_scan_id FROM sf_batches) AND id NOT IN (SELECT source_scan_id FROM reach_batches) ORDER BY created DESC LIMIT -1 OFFSET 100)")
 
     def add_result(self, scan_id, host, sources):
         with self.connect() as db:
@@ -303,6 +325,135 @@ class Store:
         with self.connect() as db:
             db.execute('DELETE FROM sf_scans WHERE id=?', (scan_id,))
 
+    # -- reachability batches ------------------------------------------------
+
+    @staticmethod
+    def _trim_reach(db):
+        # Keep the ten most recent finished batches; an active batch is never
+        # trimmed. Deleting a batch cascades its host results.
+        db.execute("DELETE FROM reach_batches WHERE id IN (SELECT id FROM reach_batches WHERE status NOT IN ('queued','running') ORDER BY created DESC LIMIT -1 OFFSET 10)")
+
+    def reach_batch_create(self, batch_id, source_id, options, hosts=None, query=''):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            source = db.execute('SELECT domain,status FROM scans WHERE id=?', (source_id,)).fetchone()
+            if source is None:
+                raise ValueError('The source discovery scan no longer exists.')
+            if source['status'] in ('queued', 'running'):
+                raise ValueError('Wait for subdomain discovery to finish before checking reachability.')
+            if db.execute("SELECT 1 FROM reach_batches WHERE status IN ('queued','running') LIMIT 1").fetchone():
+                raise ValueError('A reachability batch is already active. Wait for it to finish or cancel it.')
+            if hosts is None:
+                escaped = query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+                hosts = [r['host'] for r in db.execute("SELECT host FROM results WHERE scan_id=? AND host LIKE ? ESCAPE '\\' ORDER BY host LIMIT ?",
+                                                      (source_id, '%' + escaped + '%', MAX_REACH_HOSTS + 1))]
+            else:
+                hosts = sorted(set(hosts))
+                found = {r['host'] for r in db.execute('SELECT host FROM results WHERE scan_id=? AND host IN (' + ','.join('?' for _ in hosts) + ')', (source_id, *hosts))}
+                if found != set(hosts):
+                    raise ValueError('Select only hosts saved in this discovery scan.')
+            if not hosts:
+                raise ValueError('No subdomains match this selection.')
+            if len(hosts) > MAX_REACH_HOSTS:
+                raise ValueError(f'Choose up to {MAX_REACH_HOSTS} hosts or narrow the subdomain filter. No hosts were queued.')
+            if any(host != source['domain'] and not host.endswith('.' + source['domain']) for host in hosts):
+                raise ValueError('A selected host is outside the discovery domain.')
+            db.execute('INSERT INTO reach_batches (id,source_scan_id,source_domain,status,created,options,query,total) VALUES (?,?,?,?,?,?,?,?)',
+                       (batch_id, source_id, source['domain'], 'queued', time.time(), json.dumps(options), query, len(hosts)))
+            db.executemany('INSERT INTO reach_results (batch_id,host) VALUES (?,?)', [(batch_id, host) for host in hosts])
+            self._trim_reach(db)
+        return self.reach_batch_get(batch_id)
+
+    def reach_batch_get(self, batch_id, items=True):
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM reach_batches WHERE id=?', (batch_id,)).fetchone()
+            if row is None:
+                return None
+            batch = dict(row)
+            batch['options'] = json.loads(batch['options'])
+            batch['cancel_requested'] = bool(batch.pop('cancelled'))
+            reachable = db.execute('SELECT count(*) FROM reach_results WHERE batch_id=? AND reachable=1', (batch_id,)).fetchone()[0]
+            errored = db.execute("SELECT count(*) FROM reach_results WHERE batch_id=? AND state='done' AND reachable=0", (batch_id,)).fetchone()[0]
+            batch['reachable'] = reachable
+            batch['unreachable'] = errored
+            if items:
+                batch['items'] = [self._reach_row(r) for r in db.execute(
+                    'SELECT host,state,reachable,scheme,status,server,final_url,error,elapsed_ms,details FROM reach_results WHERE batch_id=? ORDER BY host', (batch_id,))]
+        return batch
+
+    @staticmethod
+    def _reach_row(r):
+        return {'host': r['host'], 'state': r['state'],
+                'reachable': None if r['reachable'] is None else bool(r['reachable']),
+                'scheme': r['scheme'], 'status': r['status'], 'server': r['server'],
+                'final_url': r['final_url'], 'error': r['error'], 'elapsed_ms': r['elapsed_ms'],
+                'details': json.loads(r['details'])}
+
+    def reach_batches(self, source_id=None):
+        with self.connect() as db:
+            ids = [r['id'] for r in db.execute('SELECT id FROM reach_batches' + (' WHERE source_scan_id=?' if source_id else '') + ' ORDER BY created DESC', (source_id,) if source_id else ())]
+        return [batch for batch_id in ids if (batch := self.reach_batch_get(batch_id, items=False)) is not None]
+
+    def reach_pending(self):
+        with self.connect() as db:
+            return [r['id'] for r in db.execute("SELECT id FROM reach_batches WHERE status='queued' ORDER BY created,id")]
+
+    def reach_start(self, batch_id):
+        """Claim a queued batch for this worker. Returns its pending hosts."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT status,cancelled FROM reach_batches WHERE id=?', (batch_id,)).fetchone()
+            if row is None or row['status'] != 'queued':
+                return None
+            if row['cancelled']:
+                db.execute("UPDATE reach_batches SET status='cancelled',finished=? WHERE id=?", (time.time(), batch_id))
+                return None
+            db.execute("UPDATE reach_batches SET status='running',started=COALESCE(started,?) WHERE id=?", (time.time(), batch_id))
+            return [r['host'] for r in db.execute("SELECT host FROM reach_results WHERE batch_id=? AND state='pending' ORDER BY host", (batch_id,))]
+
+    def reach_record(self, batch_id, result):
+        """Store one host's probe result and bump the batch's done counter."""
+        with self.connect() as db:
+            updated = db.execute(
+                "UPDATE reach_results SET state='done',reachable=?,scheme=?,status=?,server=?,final_url=?,error=?,elapsed_ms=?,details=? "
+                "WHERE batch_id=? AND host=? AND state='pending'",
+                (1 if result['reachable'] else 0, result['scheme'], result['status'], result['server'],
+                 result['final_url'], result['error'], result['elapsed_ms'], json.dumps(result['details']),
+                 batch_id, result['host'])).rowcount
+            if updated:
+                db.execute('UPDATE reach_batches SET done=done+1 WHERE id=?', (batch_id,))
+
+    def reach_cancelled(self, batch_id):
+        with self.connect() as db:
+            row = db.execute('SELECT cancelled FROM reach_batches WHERE id=?', (batch_id,)).fetchone()
+            return row is None or bool(row['cancelled'])
+
+    def reach_finish(self, batch_id, error=None, timed_out=False):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT cancelled FROM reach_batches WHERE id=?', (batch_id,)).fetchone()
+            if row is None:
+                return
+            if row['cancelled']:
+                status = 'cancelled'
+            elif error:
+                status = 'failed'
+            elif timed_out:
+                status, error = 'timed_out', 'The batch reached its time limit. Finished host results are saved.'
+            else:
+                status = 'completed'
+            db.execute('UPDATE reach_batches SET status=?,finished=?,error=? WHERE id=?', (status, time.time(), error, batch_id))
+            self._trim_reach(db)
+
+    def reach_batch_cancel(self, batch_id):
+        with self.connect() as db:
+            db.execute('UPDATE reach_batches SET cancelled=1 WHERE id=?', (batch_id,))
+
+    def reach_batch_delete(self, batch_id):
+        with self.connect() as db:
+            db.execute('DELETE FROM reach_batches WHERE id=?', (batch_id,))
+            self._trim_subdomains(db)
+
     # -- shared activity across tools ---------------------------------------
 
     def delete_activities(self, items):
@@ -311,7 +462,7 @@ class Store:
             raise ValueError('Select between 1 and 500 activities.')
         selection = set()
         for item in items:
-            if (not isinstance(item, dict) or item.get('kind') not in ('subdomains', 'salesforce', 'salesforce_batch')
+            if (not isinstance(item, dict) or item.get('kind') not in ('subdomains', 'salesforce', 'salesforce_batch', 'reachability_batch')
                     or not isinstance(item.get('id'), str) or not re.fullmatch(r'[a-f0-9]{32}', item['id'])):
                 raise ValueError('Invalid activity selection.')
             key = (item['kind'], item['id'])
@@ -324,6 +475,9 @@ class Store:
                 if kind == 'salesforce_batch':
                     row = db.execute('SELECT id FROM sf_batches WHERE id=?', (activity_id,)).fetchone()
                     busy = db.execute("SELECT 1 FROM sf_scans WHERE batch_id=? AND status IN ('queued','running') LIMIT 1", (activity_id,)).fetchone()
+                elif kind == 'reachability_batch':
+                    row = db.execute('SELECT status FROM reach_batches WHERE id=?', (activity_id,)).fetchone()
+                    busy = row is not None and row['status'] in ('queued', 'running')
                 elif kind == 'salesforce':
                     row = db.execute('SELECT status,batch_id FROM sf_scans WHERE id=?', (activity_id,)).fetchone()
                     if row is not None and row['batch_id'] is not None:
@@ -333,13 +487,14 @@ class Store:
                     row = db.execute('SELECT status FROM scans WHERE id=?', (activity_id,)).fetchone()
                     busy = row is not None and row['status'] in ('queued', 'running')
                     busy = busy or db.execute("SELECT 1 FROM sf_scans s JOIN sf_batches b ON s.batch_id=b.id WHERE b.source_scan_id=? AND s.status IN ('queued','running') LIMIT 1", (activity_id,)).fetchone()
+                    busy = busy or db.execute("SELECT 1 FROM reach_batches WHERE source_scan_id=? AND status IN ('queued','running') LIMIT 1", (activity_id,)).fetchone()
                 if row is None:
                     raise ValueError('Activity history changed. Refresh and select the activities again. Nothing was deleted.')
                 if busy:
-                    raise ValueError('Cancel active scans and Salesforce batches and wait for them to stop. Nothing was deleted.')
+                    raise ValueError('Cancel active scans, Salesforce batches, and reachability batches and wait for them to stop. Nothing was deleted.')
             # Batch-first ordering also handles a selected discovery plus its
             # selected batch. Source deletion still cascades any other batches.
-            for kind, table in (('salesforce_batch', 'sf_batches'), ('salesforce', 'sf_scans'), ('subdomains', 'scans')):
+            for kind, table in (('salesforce_batch', 'sf_batches'), ('reachability_batch', 'reach_batches'), ('salesforce', 'sf_scans'), ('subdomains', 'scans')):
                 db.executemany(f'DELETE FROM {table} WHERE id=?', [(activity_id,) for selected_kind, activity_id in selection if selected_kind == kind])
         return {'deleted': len(selection)}
 
@@ -361,9 +516,16 @@ class Store:
                           'tool': 'salesforce', 'label': batch['source_domain'], 'status': batch['status'],
                           'created': batch['created'], 'started': batch['started'], 'finished': batch['finished'],
                           'count': batch['done'], 'total': batch['total'], 'leaking': batch['leaking'], 'verdict': None})
-        protected_sources = {item['source_scan_id'] for item in items if item.get('batch_id') and item['status'] in ('queued', 'running')}
+        for batch in self.reach_batches():
+            items.append({'id': batch['id'], 'reach_batch_id': batch['id'], 'source_scan_id': batch['source_scan_id'],
+                          'tool': 'reachability', 'label': batch['source_domain'], 'status': batch['status'],
+                          'created': batch['created'], 'started': batch['started'], 'finished': batch['finished'],
+                          'count': batch['done'], 'total': batch['total'], 'reachable': batch['reachable'], 'verdict': None})
+        protected_sources = {item['source_scan_id'] for item in items
+                             if (item.get('batch_id') or item.get('reach_batch_id')) and item['status'] in ('queued', 'running')}
         for item in items:
-            item['delete_kind'] = 'salesforce_batch' if item.get('batch_id') else item['tool']
+            item['delete_kind'] = ('salesforce_batch' if item.get('batch_id')
+                                   else 'reachability_batch' if item.get('reach_batch_id') else item['tool'])
             item['deletable'] = item['status'] not in ('queued', 'running') and not (item['tool'] == 'subdomains' and item['id'] in protected_sources)
         items.sort(key=lambda item: item['created'], reverse=True)
         return items

@@ -94,6 +94,23 @@
             <div class="batch-actions"><button id="sf-batch-cancel" class="button small danger">Cancel remaining scans</button><a id="sf-batch-export" class="button small" download>Export batch JSON</a></div>
             <div class="result-table batch-table"><table><thead><tr><th scope="col">Host</th><th scope="col">Status</th><th scope="col">Outcome</th><th scope="col">Result</th></tr></thead><tbody id="sf-batch-rows"></tbody></table></div>
           </section>
+          <section id="reach-bulk" class="panel batch-panel" aria-labelledby="reach-bulk-title" hidden>
+            <h3 id="reach-bulk-title">Check which hosts are reachable</h3>
+            <p class="help" id="reach-bulk-help">Probe the selected hosts (or all matching results) over HTTPS and HTTP to see which ones actually serve a response. Up to 500 hosts per batch.</p>
+            <div class="options batch-options">
+              <label>Request timeout <span class="unit">seconds</span><input id="reach-timeout" type="number" min="3" max="20" value="8" required></label>
+              <label>Concurrency <span class="unit">hosts at once</span><input id="reach-concurrency" type="number" min="1" max="20" value="10" required></label>
+            </div>
+            <div class="batch-actions"><button id="reach-check-selected" class="button">Check selected (0)</button><button id="reach-check-matching" class="button primary">Check all matching (0)</button><button id="reach-clear-selection" class="button small">Clear selection</button></div>
+            <p class="help" id="reach-bulk-scope"></p>
+          </section>
+          <section id="reach-batch-panel" class="panel batch-panel" aria-labelledby="reach-batch-title" hidden>
+            <div class="section-top"><h3 id="reach-batch-title">Reachability results</h3><span id="reach-batch-status" class="status"></span></div>
+            <label for="reach-batch-history">Saved reachability batches for this discovery</label><select id="reach-batch-history"></select>
+            <p id="reach-batch-progress" role="status"></p><p id="reach-batch-note" class="help"></p>
+            <div class="batch-actions"><button id="reach-batch-cancel" class="button small danger">Cancel remaining hosts</button><a id="reach-batch-export" class="button small" download>Export JSON</a><a id="reach-batch-export-csv" class="button small" download>Export CSV</a></div>
+            <div class="result-table batch-table"><table><thead><tr><th scope="col">Host</th><th scope="col">Reachable</th><th scope="col">Response</th><th scope="col">Server</th></tr></thead><tbody id="reach-batch-rows"></tbody></table></div>
+          </section>
         </section>
       </section>
       <section id="salesforce-view" hidden>
