@@ -18,11 +18,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from app.reach_runner import ReachabilityRunner
 from app.runner import Runner
 from app.salesforce import safe_target
 from app.security import normalize_domain, proxy_token, verify_password
 from app.sf_runner import SalesforceRunner
-from app.store import Store, MAX_SF_BATCH_HOSTS
+from app.store import Store, MAX_SF_BATCH_HOSTS, MAX_REACH_HOSTS
 
 STATIC = Path(__file__).parent / 'static'
 
@@ -53,6 +54,7 @@ class Application:
             raise ValueError('SUBFINDER_PROVIDER_CONFIG must point to a readable file.')
         self.runner = Runner(self.store, os.environ.get('SUBFINDER_BIN', 'subfinder'), provider)
         self.sf_runner = SalesforceRunner(self.store)
+        self.reach_runner = ReachabilityRunner(self.store)
 
     def session(self, token):
         with self.lock:
@@ -136,6 +138,16 @@ class Handler(BaseHTTPRequestHandler):
     def sf_options(data):
         options = {}
         for key, default, low, high in [('sample_size', 10, 1, 25), ('max_objects', 50, 1, 200)]:
+            value = data.get(key, default)
+            if type(value) is not int or not low <= value <= high:
+                raise APIError(400, f'{key} must be between {low} and {high}.')
+            options[key] = value
+        return options
+
+    @staticmethod
+    def reach_options(data):
+        options = {}
+        for key, default, low, high in [('timeout', 8, 3, 20), ('concurrency', 10, 1, 20)]:
             value = data.get(key, default)
             if type(value) is not int or not low <= value <= high:
                 raise APIError(400, f'{key} must be between {low} and {high}.')
@@ -231,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
                             raise APIError(400, f'{key} must be true or false.')
                         opts[key] = value
                     return self.send(201, self.app.runner.submit(domain, opts))
-            match = re.fullmatch(r'/api/scans/([a-f0-9]{32})(?:/(results|export|cancel|sf-batches))?', path)
+            match = re.fullmatch(r'/api/scans/([a-f0-9]{32})(?:/(results|export|cancel|sf-batches|reach-batches))?', path)
             if match:
                 scan_id, action = match.groups()
                 scan = self.app.store.get(scan_id)
@@ -255,6 +267,25 @@ class Handler(BaseHTTPRequestHandler):
                         if not isinstance(filter_query, str) or len(filter_query) > 253 or (hosts is not None and filter_query):
                             raise APIError(400, 'Choose selected hosts or a subdomain filter, not both.')
                         return self.send(201, self.app.sf_runner.submit_batch(scan_id, self.sf_options(data), hosts, filter_query))
+                if action == 'reach-batches':
+                    if method == 'GET':
+                        return self.send(200, self.app.store.reach_batches(scan_id))
+                    if method == 'POST':
+                        data = self.body(max_bytes=131072)
+                        if scan['status'] in ('queued', 'running'):
+                            raise APIError(409, 'Wait for subdomain discovery to finish before checking reachability.')
+                        hosts = data.get('hosts')
+                        if hosts is not None:
+                            if not isinstance(hosts, list) or not 1 <= len(hosts) <= MAX_REACH_HOSTS:
+                                raise APIError(400, f'Select between 1 and {MAX_REACH_HOSTS} hosts.')
+                            hosts = sorted({normalize_domain(host) for host in hosts})
+                        filter_query = data.get('q', '')
+                        if not isinstance(filter_query, str) or len(filter_query) > 253 or (hosts is not None and filter_query):
+                            raise APIError(400, 'Choose selected hosts or a subdomain filter, not both.')
+                        try:
+                            return self.send(201, self.app.reach_runner.submit_batch(scan_id, self.reach_options(data), hosts, filter_query))
+                        except ValueError as error:
+                            raise APIError(409, str(error)) from None
                 if method == 'GET' and action == 'results':
                     try:
                         offset = int(query.get('offset', ['0'])[0])
@@ -340,6 +371,43 @@ class Handler(BaseHTTPRequestHandler):
                     if batch['status'] in ('queued', 'running'):
                         raise APIError(409, 'Cancel the batch and wait for it to stop before deleting it.')
                     self.app.store.sf_batch_delete(batch_id)
+                    return self.send(200, {'ok': True})
+            match = re.fullmatch(r'/api/reach-batches/([a-f0-9]{32})(?:/(cancel|export))?', path)
+            if match:
+                batch_id, action = match.groups()
+                batch = self.app.store.reach_batch_get(batch_id)
+                if not batch:
+                    raise APIError(404, 'Reachability batch not found.')
+                if method == 'GET' and not action:
+                    return self.send(200, batch)
+                if method == 'GET' and action == 'export':
+                    fmt = query.get('format', ['json'])[0]
+                    if fmt == 'json':
+                        body, mime = json.dumps(batch, indent=2), 'application/json'
+                    elif fmt == 'csv':
+                        output = io.StringIO()
+                        writer = csv.writer(output)
+                        writer.writerow(['host', 'reachable', 'scheme', 'status', 'server', 'final_url', 'error', 'elapsed_ms'])
+                        for row in batch['items']:
+                            server_name = row['server'] or ''
+                            if server_name.startswith(('=', '+', '-', '@', '\t', '\r')):
+                                server_name = "'" + server_name
+                            writer.writerow([row['host'], '' if row['reachable'] is None else ('yes' if row['reachable'] else 'no'),
+                                             row['scheme'] or '', '' if row['status'] is None else row['status'],
+                                             server_name, row['final_url'] or '', row['error'] or '',
+                                             '' if row['elapsed_ms'] is None else row['elapsed_ms']])
+                        body, mime = output.getvalue(), 'text/csv; charset=utf-8'
+                    else:
+                        raise APIError(400, 'Choose json or csv.')
+                    return self.send(200, body, mime, {'Content-Disposition': f'attachment; filename="{batch["source_domain"]}-reachability-{batch_id[:8]}.{fmt}"'})
+                if method == 'POST' and action == 'cancel':
+                    self.body()
+                    self.app.reach_runner.cancel_batch(batch_id)
+                    return self.send(200, {'ok': True})
+                if method == 'DELETE' and not action:
+                    if batch['status'] in ('queued', 'running'):
+                        raise APIError(409, 'Cancel the batch and wait for it to stop before deleting it.')
+                    self.app.store.reach_batch_delete(batch_id)
                     return self.send(200, {'ok': True})
             match = re.fullmatch(r'/api/sf-scans/([a-f0-9]{32})(?:/(findings|export|cancel))?', path)
             if match:
@@ -538,6 +606,7 @@ def main():
     finally:
         app.runner.close()
         app.sf_runner.close()
+        app.reach_runner.close()
         server.server_close()
 
 

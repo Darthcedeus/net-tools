@@ -6,6 +6,7 @@ const state = {
   csrf: null, authenticated: false, generation: 0, engine: false, busy: false, tab: 'home',
   selected: null, offset: 0, total: 0, query: '',
   selectedHosts: new Set(), sfBatch: null, sfBatches: [], batchBusy: false,
+  reachBatch: null, reachBatches: [], reachBusy: false,
   sfSelected: null, sfOffset: 0, sfTotal: 0, sfQuery: '', sfReadable: false,
   activity: [],
   activitySelection: new Set(), activityDeleting: false, activityRequest: 0,
@@ -14,6 +15,7 @@ const ROUTES = { home: '/', discovery: SUBDOMAINS.path, salesforce: SALESFORCE.p
 const PAGE_TITLES = { home: 'Home', discovery: SUBDOMAINS.name, salesforce: SALESFORCE.name, history: 'Activity' };
 const active = (scan) => scan && ['queued', 'running'].includes(scan.status);
 const statuses = { completed: 'Completed', running: 'Scanning', queued: 'Queued', cancelled: 'Cancelled', failed: 'Failed', timed_out: 'Timed out', interrupted: 'Interrupted', limited: 'Result limit reached' };
+const reachErrors = { timeout: 'Timed out', refused: 'Connection refused', tls_error: 'TLS error', tls_cert_error: 'TLS certificate error', dns_error: 'DNS error', unreachable: 'Unreachable', probe_error: 'Probe error' };
 const verdicts = { leaking: 'Leaking', salesforce: 'Salesforce', not_salesforce: 'Not Salesforce' };
 const verdictClass = { leaking: 'verdict-leaking', salesforce: 'verdict-ok', not_salesforce: 'verdict-none' };
 let filterTimer, sfFilterTimer, toastTimer;
@@ -86,7 +88,7 @@ async function resumeWorkspace() {
   } else if (state.tab === 'discovery') {
     const scan = id ? await api(`/api/scans/${id}`).catch(() => null) : state.selected;
     if (!guard(generation, route)) return;
-    if (scan) { if (state.selected?.id !== scan.id) { state.selectedHosts.clear(); state.sfBatch = null; state.sfBatches = []; } state.selected = scan; state.generation++; paintScan(); await refreshResults(); }
+    if (scan) { if (state.selected?.id !== scan.id) { state.selectedHosts.clear(); state.sfBatch = null; state.sfBatches = []; state.reachBatch = null; state.reachBatches = []; } state.selected = scan; state.generation++; paintScan(); await refreshResults(); }
   }
 }
 function guard(generation, route) {
@@ -107,18 +109,19 @@ function elapsed(scan) {
 function paintScan() {
   const scan = state.selected;
   $('scan-summary').hidden = !scan; $('scan-status').hidden = !scan; $('result-tools').hidden = !scan;
-  $('sf-bulk').hidden = !scan;
-  if (!scan) { $('result-table').hidden = true; $('pagination').hidden = true; $('empty').hidden = false; $('sf-batch-panel').hidden = true; return; }
+  $('sf-bulk').hidden = !scan; $('reach-bulk').hidden = !scan;
+  if (!scan) { $('result-table').hidden = true; $('pagination').hidden = true; $('empty').hidden = false; $('sf-batch-panel').hidden = true; $('reach-batch-panel').hidden = true; return; }
   $('scan-status').className = 'status ' + scan.status; $('scan-status').textContent = statuses[scan.status] || scan.status;
   $('scan-domain').textContent = scan.domain;
   $('scan-stats').textContent = `${scan.count.toLocaleString()} subdomain${scan.count === 1 ? '' : 's'} · ${elapsed(scan)}`;
   $('cancel').hidden = !active(scan); $('rerun').hidden = active(scan);
   message('scan-note', scan.error || (scan.status === 'queued' ? 'Your scan is queued and will start when the current scan finishes.' : scan.status === 'running' ? 'Discovery and IP lookups are running. You can leave this page; results will be saved on your server.' : ''));
-  paintBatchActions();
+  paintBatchActions(); paintReachActions();
 }
 async function selectScan(scan) {
   state.generation++; state.selected = scan; state.offset = 0; state.query = ''; $('filter').value = '';
   state.selectedHosts.clear(); state.sfBatch = null; state.sfBatches = []; $('sf-batch-panel').hidden = true;
+  state.reachBatch = null; state.reachBatches = []; $('reach-batch-panel').hidden = true;
   $('cancel').disabled = false; $('cancel').textContent = 'Cancel scan';
   setTab('discovery', { scanId: scan.id, load: false }); paintScan(); await refreshResults();
 }
@@ -139,7 +142,7 @@ async function refreshResults() {
     checkbox.addEventListener('change', () => {
       if (checkbox.checked && state.selectedHosts.size >= 100) { checkbox.checked = false; toast('Select up to 100 hosts per batch.'); return; }
       if (checkbox.checked) state.selectedHosts.add(item.host); else state.selectedHosts.delete(item.host);
-      paintBatchActions();
+      paintBatchActions(); paintReachActions();
     });
     hostname.textContent = item.host; choice.append(checkbox, hostname); host.append(choice); list.className = 'source-list';
     const addresses = document.createElement('td'); addresses.className = 'ip-cell'; addresses.dataset.label = 'IP addresses';
@@ -166,6 +169,7 @@ async function refreshResults() {
   $('page-label').textContent = `${(offset + 1).toLocaleString()}–${(offset + results.items.length).toLocaleString()} of ${results.total.toLocaleString()}${query ? ' matching' : ''} subdomains`;
   $('previous').disabled = offset === 0; $('next').disabled = offset + 200 >= results.total;
   await refreshBatches();
+  await refreshReachBatches();
 }
 
 /* ---- Salesforce batches from discovery results -------------------------- */
@@ -241,6 +245,90 @@ async function startBatch(selected) {
     }
     await refreshActivity(); toast(`Salesforce batch queued for ${batch.total} hosts.`);
   } catch (error) { reportError(error); } finally { state.batchBusy = false; paintBatchActions(); }
+}
+
+/* ---- Reachability batches from discovery results ------------------------ */
+
+function paintReachActions() {
+  const blocked = active(state.selected) || state.reachBusy || state.reachBatches.some(active);
+  $('reach-check-selected').textContent = `Check selected (${state.selectedHosts.size})`;
+  $('reach-check-matching').textContent = `Check all matching (${state.total.toLocaleString()})`;
+  $('reach-check-selected').disabled = blocked || !state.selectedHosts.size;
+  $('reach-check-matching').disabled = blocked || !state.total || state.total > 500;
+  $('reach-clear-selection').disabled = !state.selectedHosts.size || state.reachBusy;
+  $('reach-bulk-scope').textContent = active(state.selected) ? 'Wait for discovery to finish. The batch uses a snapshot of saved results.' :
+    state.reachBatches.some(active) ? 'A reachability batch is running. Progress is saved even if you close this page.' :
+    state.total > 500 ? `${state.total.toLocaleString()} matching hosts. Narrow the filter or select up to 500 hosts to check.` :
+    `${state.total.toLocaleString()} matching hosts across all pages${state.query ? ` for “${state.query}”` : ''}. Only hosts saved by this discovery can be checked.`;
+}
+
+async function refreshReachBatches(preferredId = null) {
+  if (!state.selected || !state.authenticated) return;
+  const sourceId = state.selected.id, generation = state.generation;
+  const batches = await api(`/api/scans/${sourceId}/reach-batches`);
+  if (generation !== state.generation || sourceId !== state.selected?.id) return;
+  state.reachBatches = batches;
+  const id = preferredId || (batches.some(b => b.id === state.reachBatch?.id) ? state.reachBatch.id : batches[0]?.id);
+  const batch = id ? await api(`/api/reach-batches/${id}`) : null;
+  if (generation !== state.generation || sourceId !== state.selected?.id) return;
+  state.reachBatch = batch; paintReachActions(); paintReachBatch();
+}
+
+function paintReachBatch() {
+  const batch = state.reachBatch;
+  $('reach-batch-panel').hidden = !batch;
+  if (!batch) return;
+  const options = document.createDocumentFragment();
+  for (const saved of state.reachBatches) {
+    const option = document.createElement('option'); option.value = saved.id;
+    option.textContent = `${formatDate(saved.created, true)} · ${saved.done}/${saved.total} hosts · ${statuses[saved.status] || saved.status}`;
+    options.append(option);
+  }
+  $('reach-batch-history').replaceChildren(options); $('reach-batch-history').value = batch.id;
+  $('reach-batch-status').className = 'status ' + batch.status; $('reach-batch-status').textContent = statuses[batch.status] || batch.status;
+  $('reach-batch-progress').textContent = `${batch.done} of ${batch.total} hosts checked · ${batch.reachable} reachable · ${batch.unreachable} unreachable`;
+  $('reach-batch-note').textContent = `${batch.query ? `Filter: “${batch.query}”. ` : ''}${batch.error || 'Each host is probed over HTTPS then HTTP. Any HTTP response counts as reachable; redirects are not followed.'}`;
+  $('reach-batch-cancel').hidden = !active(batch); $('reach-batch-cancel').disabled = batch.cancel_requested;
+  $('reach-batch-cancel').textContent = batch.cancel_requested ? 'Cancelling…' : 'Cancel remaining hosts';
+  $('reach-batch-export').href = `/api/reach-batches/${batch.id}/export?format=json`;
+  $('reach-batch-export-csv').href = `/api/reach-batches/${batch.id}/export?format=csv`;
+  const rows = document.createDocumentFragment();
+  for (const item of batch.items) {
+    const row = document.createElement('tr'), host = document.createElement('td'), reachable = document.createElement('td'), response = document.createElement('td'), server = document.createElement('td');
+    host.textContent = item.host;
+    reachable.dataset.label = 'Reachable';
+    const badge = document.createElement('span');
+    if (item.state !== 'done') { badge.className = 'status queued'; badge.textContent = 'Pending'; }
+    else if (item.reachable) { badge.className = 'status completed'; badge.textContent = item.scheme === 'https' ? 'HTTPS' : 'HTTP'; }
+    else { badge.className = 'status failed'; badge.textContent = 'No'; }
+    reachable.append(badge);
+    response.dataset.label = 'Response';
+    if (item.state !== 'done') response.textContent = '—';
+    else if (item.reachable) {
+      response.textContent = `${item.status}`;
+      if (item.final_url) { const url = document.createElement('div'); url.className = 'help mono'; url.textContent = item.final_url; response.append(url); }
+    } else response.textContent = reachErrors[item.error] || item.error || 'Unreachable';
+    server.dataset.label = 'Server'; server.className = 'mono'; server.textContent = item.server || '—';
+    row.append(host, reachable, response, server); rows.append(row);
+  }
+  $('reach-batch-rows').replaceChildren(rows);
+}
+
+async function startReach(selected) {
+  if (!state.selected || state.reachBusy) return;
+  if (!$('reach-timeout').reportValidity() || !$('reach-concurrency').reportValidity()) return;
+  const sourceId = state.selected.id, generation = state.generation;
+  const data = { timeout: Number($('reach-timeout').value), concurrency: Number($('reach-concurrency').value),
+    ...(selected ? { hosts: [...state.selectedHosts] } : { q: state.query }) };
+  state.reachBusy = true; paintReachActions(); message('app-error', '');
+  try {
+    const batch = await api(`/api/scans/${sourceId}/reach-batches`, { method: 'POST', body: JSON.stringify(data) });
+    if (generation === state.generation && sourceId === state.selected?.id) {
+      await refreshReachBatches(batch.id); state.selectedHosts.clear(); await refreshResults();
+      $('reach-batch-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+    await refreshActivity(); toast(`Reachability batch queued for ${batch.total} host${batch.total === 1 ? '' : 's'}.`);
+  } catch (error) { reportError(error); } finally { state.reachBusy = false; paintReachActions(); }
 }
 
 /* ---- Salesforce Detector ------------------------------------------------ */
@@ -327,6 +415,7 @@ async function refreshSfResults() {
 
 function activityMeta(item) {
   if (item.batch_id) return 'Salesforce batch';
+  if (item.reach_batch_id) return 'Reachability batch';
   if (item.tool === 'salesforce') {
     const verdict = item.verdict && verdicts[item.verdict] ? verdicts[item.verdict] : '';
     return `${toolName(item.tool)}${verdict ? ' · ' + verdict : ''}`;
@@ -335,6 +424,7 @@ function activityMeta(item) {
 }
 function activityCount(item) {
   if (item.batch_id) return `${item.count}/${item.total} hosts finished · ${item.leaking} leaking`;
+  if (item.reach_batch_id) return `${item.count}/${item.total} hosts checked · ${item.reachable} reachable`;
   if (item.tool === 'salesforce') return `${item.count.toLocaleString()} readable object${item.count === 1 ? '' : 's'}`;
   return `${item.count.toLocaleString()} subdomain${item.count === 1 ? '' : 's'}`;
 }
@@ -348,6 +438,7 @@ function activityBadge(item) {
 async function openActivity(item) {
   try {
     if (item.batch_id) { await selectScan(await api(`/api/scans/${item.source_scan_id}`)); await refreshBatches(item.batch_id); $('sf-batch-panel').scrollIntoView({ block: 'start' }); }
+    else if (item.reach_batch_id) { await selectScan(await api(`/api/scans/${item.source_scan_id}`)); await refreshReachBatches(item.reach_batch_id); $('reach-batch-panel').scrollIntoView({ block: 'start' }); }
     else if (item.tool === 'salesforce') { const scan = await api(`/api/sf-scans/${item.id}`); await selectSfScan(scan); }
     else { const scan = await api(`/api/scans/${item.id}`); await selectScan(scan); }
   } catch (error) { reportError(error); }
@@ -371,9 +462,9 @@ function paintActivitySelection() {
 }
 async function deleteActivities(items) {
   if (state.activityDeleting || !items.length) return;
-  const labels = items.slice(0, 5).map(item => `${item.batch_id ? 'Salesforce batch' : toolName(item.tool)}: ${item.label}`).join('\n');
+  const labels = items.slice(0, 5).map(item => `${activityMeta(item)}: ${item.label}`).join('\n');
   const extra = items.length > 5 ? `\n…and ${items.length - 5} more.` : '';
-  const cascades = items.some(item => item.tool === 'subdomains') ? '\nDeleting a discovery also deletes its Salesforce batches.' : '';
+  const cascades = items.some(item => item.tool === 'subdomains') ? '\nDeleting a discovery also deletes its Salesforce and reachability batches.' : '';
   if (!confirm(`Permanently delete ${items.length} selected activit${items.length === 1 ? 'y' : 'ies'} and their saved results?\n\n${labels}${extra}${cascades}`)) return;
   state.activityDeleting = true; state.activityRequest++; message('app-error', ''); paintActivitySelection(); renderActivityRows();
   try {
@@ -383,8 +474,10 @@ async function deleteActivities(items) {
     if (state.sfSelected && (items.some(item => !item.batch_id && item.tool === 'salesforce' && item.id === state.sfSelected.id) || batches.has(state.sfSelected.batch_id))) {
       state.sfSelected = null; state.generation++; paintSfScan(); message('sf-note', '');
     }
-    if (sources.has(state.selected?.id)) { state.selected = null; state.sfBatch = null; state.sfBatches = []; state.selectedHosts.clear(); state.generation++; paintScan(); message('scan-note', ''); }
+    if (sources.has(state.selected?.id)) { state.selected = null; state.sfBatch = null; state.sfBatches = []; state.reachBatch = null; state.reachBatches = []; state.selectedHosts.clear(); state.generation++; paintScan(); message('scan-note', ''); }
     else if (state.selected && batches.size) { state.sfBatch = null; await refreshBatches(); }
+    const reachBatches = new Set([...items.filter(item => item.reach_batch_id).map(item => item.id), ...state.activity.filter(item => item.reach_batch_id && sources.has(item.source_scan_id)).map(item => item.id)]);
+    if (state.selected && !sources.has(state.selected.id) && reachBatches.size) { if (reachBatches.has(state.reachBatch?.id)) state.reachBatch = null; await refreshReachBatches(); }
     state.activitySelection.clear(); toast('Selected activities deleted.');
   } catch (error) { reportError(error); }
   finally { state.activityDeleting = false; await refreshActivity().catch(reportError); paintActivitySelection(); }
@@ -487,7 +580,7 @@ $('rerun').addEventListener('click', () => {
   $('domain').value = scan.domain; $('max-time').value = scan.options.max_time; $('timeout').value = scan.options.timeout; $('rate-limit').value = scan.options.rate_limit; $('all-sources').checked = scan.options.all_sources; $('recursive').checked = scan.options.recursive;
   $('domain').focus(); $('scan-form').scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth', block: 'center' }); toast('Scan options restored. Press Start discovery to run again.');
 });
-$('filter').addEventListener('input', () => { state.query = $('filter').value.trim(); state.offset = 0; state.selectedHosts.clear(); paintBatchActions(); clearTimeout(filterTimer); filterTimer = setTimeout(() => refreshResults().catch(reportError), 200); });
+$('filter').addEventListener('input', () => { state.query = $('filter').value.trim(); state.offset = 0; state.selectedHosts.clear(); paintBatchActions(); paintReachActions(); clearTimeout(filterTimer); filterTimer = setTimeout(() => refreshResults().catch(reportError), 200); });
 $('sf-scan-selected').addEventListener('click', () => startBatch(true));
 $('sf-scan-matching').addEventListener('click', () => startBatch(false));
 $('sf-clear-selection').addEventListener('click', () => { state.selectedHosts.clear(); refreshResults().catch(reportError); });
@@ -497,6 +590,16 @@ $('sf-batch-cancel').addEventListener('click', async () => {
   $('sf-batch-cancel').disabled = true;
   try { await api(`/api/sf-batches/${state.sfBatch.id}/cancel`, { method: 'POST', body: '{}' }); await refreshBatches(); }
   catch (error) { $('sf-batch-cancel').disabled = false; reportError(error); }
+});
+$('reach-check-selected').addEventListener('click', () => startReach(true));
+$('reach-check-matching').addEventListener('click', () => startReach(false));
+$('reach-clear-selection').addEventListener('click', () => { state.selectedHosts.clear(); refreshResults().catch(reportError); });
+$('reach-batch-history').addEventListener('change', () => refreshReachBatches($('reach-batch-history').value).catch(reportError));
+$('reach-batch-cancel').addEventListener('click', async () => {
+  if (!state.reachBatch) return;
+  $('reach-batch-cancel').disabled = true;
+  try { await api(`/api/reach-batches/${state.reachBatch.id}/cancel`, { method: 'POST', body: '{}' }); await refreshReachBatches(); }
+  catch (error) { $('reach-batch-cancel').disabled = false; reportError(error); }
 });
 $('previous').addEventListener('click', () => { state.offset = Math.max(0, state.offset - 200); refreshResults().catch(reportError); });
 $('next').addEventListener('click', () => { state.offset += 200; refreshResults().catch(reportError); });
@@ -554,7 +657,7 @@ async function poll() {
   if (state.busy || !state.authenticated || document.hidden) return;
   state.busy = true;
   try {
-    if (state.tab === 'discovery' && state.selected) { if (active(state.selected)) await refreshResults(); else await refreshBatches(); }
+    if (state.tab === 'discovery' && state.selected) { if (active(state.selected)) await refreshResults(); else { await refreshBatches(); await refreshReachBatches(); } }
     if (state.tab === 'salesforce' && active(state.sfSelected)) await refreshSfResults();
     if (['home', 'history'].includes(state.tab) || state.activity.some(active)) await refreshActivity();
   } catch (error) { reportError(error); } finally { state.busy = false; }

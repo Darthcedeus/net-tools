@@ -242,7 +242,7 @@ class APITests(unittest.TestCase):
         self.thread.start(); self.cookie = ''; self.csrf = ''
 
     def tearDown(self):
-        self.server.shutdown(); self.app.runner.close(); self.app.sf_runner.close(); self.server.server_close()
+        self.server.shutdown(); self.app.runner.close(); self.app.sf_runner.close(); self.app.reach_runner.close(); self.server.server_close()
         self.environment.stop(); self.directory.cleanup()
         self.dns_patch.stop()
 
@@ -709,7 +709,7 @@ class SalesforceAPITests(unittest.TestCase):
         self.thread.start(); self.cookie = ''; self.csrf = ''
 
     def tearDown(self):
-        self.server.shutdown(); self.app.runner.close(); self.app.sf_runner.close(); self.server.server_close()
+        self.server.shutdown(); self.app.runner.close(); self.app.sf_runner.close(); self.app.reach_runner.close(); self.server.server_close()
         self.public.stop(); self.environment.stop(); self.directory.cleanup()
 
     def request(self, method, path, data=None, headers=None):
